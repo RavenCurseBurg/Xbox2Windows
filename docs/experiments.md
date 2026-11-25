@@ -14821,6 +14821,7 @@ the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the gro
 The fixture records a compute producer, the indirect consumer and a copy of the argument record on one list.
 After the queue fence it checks the two guard words, the three argument words, the input buffer and all 320
 output words. With 2 and 5 groups the first 2 and 5 words respectively contain the input XOR a root constant.
+The same pipeline, bindings, and two group counts also run through direct Dispatch against the same reference.
 The zeroed record leaves the whole output untouched when the producer is omitted. A missing translation
 also preserves the output and logs the refusal. Additional cases cover multiple commands, a count buffer,
 an out-of-range record and using the argument buffer as a shader output.

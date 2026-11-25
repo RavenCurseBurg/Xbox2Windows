@@ -228,6 +228,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     invoke(list, 35, 1, gpu);
     if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
+    else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
+        invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));

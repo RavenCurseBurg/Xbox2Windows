@@ -43,12 +43,15 @@ def setup(directory, adapter):
     return cache, env
 
 
-def check(directory, consumer, env, mode, groups, written):
-    actual, result = dispatch(directory, consumer, env, 'dispatch-indirect-' + mode)
+def check(directory, consumer, env, mode, groups, written, direct=False):
+    actual, result = dispatch(directory, consumer, env, ('dispatch-reference-' if direct else 'dispatch-indirect-') + mode)
     print(result.stdout, end='')
     expected = [(((0x8b02a7f1 + i * 0x413b1) & C.MASK) ^ C.KEY) if i < written else C.SENTINEL
                 for i in range(C.WORDS)]
-    assert f'[{groups},{int(bool(groups))},{int(bool(groups))}]' in result.stdout, result.stdout
+    if direct:
+        assert len(lines(result, f'Dispatch({groups}, 1, 1) translated')) == 1, result.stderr[-2500:]
+    else:
+        assert f'[{groups},{int(bool(groups))},{int(bool(groups))}]' in result.stdout, result.stdout
     wrong = [i for i, word in enumerate(actual) if word != expected[i]]
     if wrong:
         i = wrong[0]
@@ -56,7 +59,8 @@ def check(directory, consumer, env, mode, groups, written):
                              f'{len(wrong)} differences\n{result.stderr[-2500:]}')
     for line in lines(result, 'x2w-d3d12-debug '):
         assert ' sev=0 ' not in line and ' sev=1 ' not in line, line
-    print(f'{mode}: all {C.WORDS} words match ({written} written, {C.WORDS-written} sentinel)')
+    label = 'direct' if direct else 'indirect'
+    print(f'{label} {mode}: all {C.WORDS} words match ({written} written, {C.WORDS-written} sentinel)')
     return result
 
 
@@ -76,6 +80,8 @@ def main(consumer, dxc, adapter):
         for groups in (2, 5, 0):
             run = check(directory, consumer, env, str(groups) if groups else 'zero', groups, groups)
             assert not lines(run, 'refused:'), run.stderr[-2500:]
+            if groups:
+                check(directory, consumer, env, str(groups), groups, groups, direct=True)
         for mode, reason in (('multi', 'one rootless command'), ('counted', 'no count buffer'),
                              ('outside', 'outside a unique placed buffer'), ('output-alias', 'also a bound shader resource')):
             run = check(directory, consumer, env, mode, 5, 0)
