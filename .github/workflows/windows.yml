@@ -11,10 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: parent-fix
-            source: 7a8d9c8928e7db2eb0c1721d025851733aaff68d
-          - label: both-fixtures
-            source: 5899e6df24f5fbc572017c3e878a656ecdc41c3e
+          - label: live-retry
+            source: 86415999f855f81d4de368269915ed7ece008ed4
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
