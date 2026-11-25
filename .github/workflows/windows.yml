@@ -1,18 +1,18 @@
-name: Build the two-SRV guest graphics fixture
+name: Build and run the slot 67 indirect fixture
 on:
   push:
-    branches: ['verify/graphics-joined-table']
+    branches: ['verify/slot67-indirect-dispatch']
 permissions:
   contents: read
 jobs:
   timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/graphics-joined-table'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/slot67-indirect-dispatch'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 1fac48580d8701c91567e1d24e5e9f1259accc20
+          ref: 92e06cceda6b461e24a8e9b70c408bc2b6435c1c
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -24,10 +24,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer
+          cmake --build out/mrt --target startup_stream_consumer startup_indirect_dispatch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe') {
+          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','startup_indirect_dispatch.exe') {
             $files = @(Get-ChildItem out/mrt -File -Recurse -Filter $name)
             if ($files.Count -ne 1) { throw "Expected one built $name" }
             Copy-Item -LiteralPath $files[0].FullName -Destination $stage
@@ -36,28 +36,22 @@ jobs:
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: joined-table-consumer
+          name: slot67-consumer
           path: out/mrt-artifact/
           retention-days: 2
           if-no-files-found: error
-      - name: Run the guest table readback with both compilers
+      - name: Verify the two parent fixtures on WARP
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_joined_table_pointer_(cpu|(fxc|dxc)_warp)$' 2>&1
-          $rc=$LASTEXITCODE
-          $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
-          foreach ($kind in 'fxc','dxc') {
-            foreach ($change in 0,32) {
-              $seen=@($rows | Select-String -Pattern "$kind warp table byte (0|32), $change pixels changed from the source expectation")
-              if ($seen.Count -ne 5) {throw "Expected five $kind readbacks with $change changed pixels, got $($seen.Count)"}
-            }
-          }
+          $rows=ctest --test-dir out/mrt --no-tests=error -V -R '^startup_(compute_dispatch|indirect_dispatch)_warp$' 2>&1
+          $result=$LASTEXITCODE
+          $rows | Tee-Object -FilePath out/parent-warp.log | Select-Object -Last 12
+          if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a parent check, exit $result"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: joined-table-ctest
-          path: out/graphics-table.log
+          name: slot67-results
+          path: out/parent-warp.log
           if-no-files-found: ignore
           retention-days: 2
