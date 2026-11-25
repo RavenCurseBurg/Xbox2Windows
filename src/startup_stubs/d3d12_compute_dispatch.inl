@@ -14,6 +14,22 @@ struct ComputeTranslation {
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    ~ComputeTranslation()
+    {
+        const auto mark = [](const char* text) {
+            DWORD count;
+            WriteFile(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(std::strlen(text)), &count, nullptr);
+        };
+        char control[4]{};
+        GetEnvironmentVariableA("X2W_TEST_EXIT_LIFETIME", control, sizeof(control));
+        mark("exit measurement: before compute pipeline release\n");
+        if (control[0] == 'P' || control[0] == 'B') pipeline.Detach();
+        else pipeline.Reset();
+        mark("exit measurement: after pipeline, before compute root release\n");
+        if (control[0] == 'R' || control[0] == 'B') root.Detach();
+        else root.Reset();
+        mark("exit measurement: after compute root release\n");
+    }
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated;
