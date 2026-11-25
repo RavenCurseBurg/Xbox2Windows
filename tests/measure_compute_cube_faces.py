@@ -4,7 +4,7 @@
     python tests/measure_compute_cube_faces.py dispatch <dxc> <offscreen_check> <warp|hardware>
 
 The shader reads a float3 from each input record and stores four raw result words.
-The comparison includes all 280 unwritten buffer words. Set XBOX2WINDOWS_ADAPTER to
+The comparison includes all 248 unwritten buffer words. Set XBOX2WINDOWS_ADAPTER to
 select a particular hardware adapter with the project's offscreen runner.
 """
 import argparse
@@ -28,6 +28,14 @@ ROWS = [
     ((4, 2, -4), (5, -4, -2, -8)),
     ((2, -4, 4), (4, 2, 4, 8)),
     ((-4, 4, -4), (5, 4, -4, -8)),
+]
+# All magnitudes tie and -0 compares equal to +0, so +Z wins. The signs
+# of the S, T and doubled-major results remain visible in the raw UAV.
+ROWS += [
+    ((x, y, z), (4.0, x, -y, z))
+    for x in (0.0, -0.0)
+    for y in (0.0, -0.0)
+    for z in (0.0, -0.0)
 ]
 SOURCE = """s_mov_b32 s10, s6
 s_mov_b32 s11, 0
@@ -71,7 +79,7 @@ def dispatch(dxc, runner, adapter, work):
     hlsl = fixture.G.ComputePipeline(PROGRAM, fixture.root_blob(), fixture.USER7, (len(ROWS), 1, 1)).hlsl_cs()
     case = work / 'cube.case'
     write_case(case)
-    expected_mismatches = {'correct': 0, 'face': 5, 'sc': 10, 'tc': 10, 'ma': 5, 'ties': 9}
+    expected_mismatches = {'correct': 0, 'face': 5, 'sc': 18, 'tc': 18, 'ma': 9, 'ties': 25}
     for name, count in expected_mismatches.items():
         text = hlsl
         if name in MUTATIONS:
