@@ -1,16 +1,16 @@
-name: Verify expanded FLOAT2 heap stores on WARP
+name: Verify expanded FLOAT3 heap stores on WARP
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
   readback:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/heap-d16-float2'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/heap-d16-float3'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 85e045382fc652946d7f21112824a667595a7bc3
+          ref: fa712d56085604d8833b2a499bae921cefb0d0cc
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -37,7 +37,7 @@ jobs:
           ctest --preset dev --no-tests=error -V -R '^compute_(heap_store_controls|store_aot_heap_view_store_warp)$' | Tee-Object -FilePath out/heap-readback.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (Select-String -Quiet -Path out/heap-readback.log -Pattern '\*\*\*Skipped|\*\*\*Not Run') { throw 'A selected test skipped' }
-          foreach ($expected in 'heap-store controls passed','warp D16_XY-to-FLOAT2: 17 heap-store cases and 11 shader mutations checked','warp D16_X-to-FLOAT1: 16 heap-store cases and 11 shader mutations checked','warp D16-to-FLOAT4: 12 heap-store cases and 11 shader mutations checked','warp UINT4: 12 heap-store cases and 8 shader mutations checked') {
+          foreach ($expected in 'heap-store controls passed','warp D16_XYZ-to-FLOAT3: 17 heap-store cases and 11 shader mutations checked','warp D16_XY-to-FLOAT2: 17 heap-store cases and 11 shader mutations checked','warp D16_X-to-FLOAT1: 16 heap-store cases and 11 shader mutations checked','warp D16-to-FLOAT4: 12 heap-store cases and 11 shader mutations checked','warp UINT4: 12 heap-store cases and 8 shader mutations checked') {
             if (!(Select-String -Quiet -Path out/heap-readback.log -SimpleMatch $expected)) { throw "Missing result: $expected" }
           }
           $runner = (Get-ChildItem out/build -Recurse -Filter offscreen_check.exe | Select-Object -First 1).FullName
@@ -61,8 +61,8 @@ jobs:
               return result
           subprocess.run = check
           with tempfile.TemporaryDirectory() as tmp:
-              assert t.draw(Path(tmp), sys.argv[1], sys.argv[2], "warp", "d16_xy") == 0
+              assert t.draw(Path(tmp), sys.argv[1], sys.argv[2], "warp", "d16_xyz") == 0
           assert total == 17, total
-          print(f"{total} positive FLOAT2 dispatches with debug layer enabled and zero warnings/errors")
+          print(f"{total} positive FLOAT3 dispatches with debug layer enabled and zero warnings/errors")
           "@ | out/pe-env/Scripts/python.exe -B - $dxc $runner
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
