@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 4974eeebc5d9337008a91cc06f0e414ad2807444
+          ref: 6344c7bafdbdf18fd8142db5329a27d9f448745e
           persist-credentials: false
       - name: Build and run CPU copy, address oracle and WARP draw tests
         shell: pwsh
@@ -20,14 +20,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --preset dev -B out/bc7 -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/bc7 --target startup_stub_xg_xs startup_bc7_4k_s_check startup_stream_consumer
+          cmake --build out/bc7 --target startup_stub_xg_xs startup_bc7_4k_s_check startup_bc64_supports_check startup_stream_consumer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $lines = ctest --test-dir out/bc7 --no-tests=error -V -R '^(startup_xg_bc7_(layout|draw_warp)|startup_bc7_4k_s(_x_first_control)?|bc7_tile_swizzle)$' 2>&1
+          $lines = ctest --test-dir out/bc7 --no-tests=error -V -R '^(startup_xg_bc7_(layout|draw_warp)|startup_bc7_4k_s(_x_first_control)?|startup_bc64_supports(_layout_control)?|bc7_tile_swizzle)$' 2>&1
           $rc = $LASTEXITCODE
           $lines | Write-Output
           if ($rc) { exit $rc }
           $log = $lines -join [Environment]::NewLine
-          foreach ($name in 'startup_xg_bc7_layout','startup_xg_bc7_draw_warp','startup_bc7_4k_s','startup_bc7_4k_s_x_first_control','bc7_tile_swizzle') {
+          foreach ($name in 'startup_xg_bc7_layout','startup_xg_bc7_draw_warp','startup_bc7_4k_s','startup_bc7_4k_s_x_first_control','startup_bc64_supports','startup_bc64_supports_layout_control','bc7_tile_swizzle') {
             if ($log -notmatch "$name [ .]+Passed") { throw "Test did not execute: $name" }
           }
           $stage = New-Item -ItemType Directory -Force out/bc7-artifact
