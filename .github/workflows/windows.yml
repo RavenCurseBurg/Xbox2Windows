@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 5b31b5e841cad3eace62a7e62a4f6fa130c34f7b
+          ref: 145fccd5a30abf5da37321a8cd43c8542fc43655
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -40,3 +40,24 @@ jobs:
           path: out/mrt-artifact/
           retention-days: 2
           if-no-files-found: error
+      - name: Run the guest table readback with both compilers
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_joined_table_pointer_(cpu|(fxc|dxc)_warp)$' 2>&1
+          $rc=$LASTEXITCODE
+          $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
+          foreach ($kind in 'fxc','dxc') {
+            foreach ($change in 0,32) {
+              $seen=@($rows | Select-String -Pattern "$kind warp table byte (0|32), $change pixels changed from the source expectation")
+              if ($seen.Count -ne 5) {throw "Expected five $kind readbacks with $change changed pixels, got $($seen.Count)"}
+            }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: joined-table-ctest
+          path: out/graphics-table.log
+          if-no-files-found: ignore
+          retention-days: 2
