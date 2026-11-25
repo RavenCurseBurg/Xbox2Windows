@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: cf30dc3469ceed3569059b42a6dab656c2df7506
+          ref: bd5583709917d949141011f2fcd00c0c7661a18b
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -44,6 +44,8 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
+          out/pe-env/Scripts/python.exe -B tests/startup_slot67_indirect_dispatch_check.py mutation
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(slot67_indirect_dispatch|compute_dispatch|indirect_dispatch|indirect_count|indirect_root_constants)_warp$' 2>&1
           $result=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
