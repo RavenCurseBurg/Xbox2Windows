@@ -1,7 +1,7 @@
-name: Verify per-case shader selection and batch diagnostics
+name: Compare actual integer-predicate inputs and readbacks before and after device reuse
 on:
   push:
-    branches: ['verify/pixel-batch-pairs']
+    branches: ['verify/448-predicate-draws']
 permissions:
   contents: read
 jobs:
@@ -12,7 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: 3bc6c3bb9849b1c57c0aef5b062982dd6c9b882f
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
           ref: 3ac087b05bddc78daa16783dfee318e41d841583
+          path: out/predicate-base
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: out/harness
           persist-credentials: false
       - name: Build the Debug renderer and run the WARP fixtures with the debug layer
         shell: pwsh
@@ -29,18 +38,27 @@ jobs:
           $stage = New-Item -ItemType Directory out/pixel-timing
           $build = 'out/build/dev'
           Copy-Item "$build/offscreen_check.exe" -Destination $stage
-          $rows = ctest --preset dev -V -j 1 --no-tests=error --output-junit "$stage/results.xml" -R '^(offscreen_capability_table_self_test|pixel_batch_(pairs|debug|removal)_warp)$' 2>&1
+          $rows = ctest --preset dev -V -j 1 --no-tests=error --output-junit "$stage/results.xml" -R '^(pixel_aot_comparisons_warp|pixel_batch_(pairs|debug|removal)_warp)$' 2>&1
           $rc = $LASTEXITCODE
           $rows | Set-Content "$stage/ctest.log"
           $rows | Select-Object -Last 12
           [xml]$junit = Get-Content -Raw "$stage/results.xml"
           $cases = @($junit.testsuite.testcase)
           if ($rc -or $cases.Count -ne 4 -or @($cases | Where-Object status -ne 'run').Count) {throw "CTest exited $rc"}
+          Copy-Item "$build/form_coverage/pixel_aot_comparisons_warp.txt" -Destination $stage
+          $dxc = (Get-Command dxc.exe).Source
+          $renderer = (Resolve-Path "$build/offscreen_check.exe").Path
+          foreach ($revision in 'base','candidate') {
+            $source = if ($revision -eq 'base') {'out/predicate-base'} else {'.'}
+            out/pe-env/Scripts/python.exe -B out/harness/.github/scripts/verify_predicate_replay.py $source "$stage/$revision" out/draw-inputs $dxc $renderer warp
+            if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          }
+          if ((Get-FileHash "$stage/base.json").Hash -ne (Get-FileHash "$stage/candidate.json").Hash) {throw 'HLSL, shader, reference, case result, or form record changed'}
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pixel-pairs-dev
+          name: predicate-draws-dev
           path: out/pixel-timing/
           if-no-files-found: error
           retention-days: 2
