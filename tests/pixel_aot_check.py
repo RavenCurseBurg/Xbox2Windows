@@ -3637,9 +3637,7 @@ def predicate_group_e64(first):
     return with_constants(body)
 
 
-def run_pixel_batch_statuses(renderer, backend, shader, paths):
-    command = [renderer, backend, "--check-pixel-batch", shader, *paths]
-    result = subprocess.run(command, capture_output=True, text=True)
+def pixel_batch_statuses(result, count):
     if result.returncode == 77:
         result.check_returncode()
     statuses = []
@@ -3648,11 +3646,17 @@ def run_pixel_batch_statuses(renderer, backend, shader, paths):
         if not line.startswith(prefix):
             raise AssertionError(f"Unexpected batch line {line!r}\n{result.stdout}\n{result.stderr}")
         statuses.append(line[len(prefix):])
-    if len(statuses) != len(paths) or any(status not in ("pass", "mismatch") for status in statuses):
+    if len(statuses) != count or any(status not in ("pass", "mismatch") for status in statuses):
         raise AssertionError(f"Unexpected batch statuses {statuses}\n{result.stdout}\n{result.stderr}")
     if result.returncode != int("mismatch" in statuses):
         raise AssertionError(f"Unexpected batch exit code {result.returncode}\n{result.stdout}\n{result.stderr}")
-    return statuses, result
+    return statuses
+
+
+def run_pixel_batch_statuses(renderer, backend, shader, paths):
+    command = [renderer, backend, "--check-pixel-batch", shader, *paths]
+    result = subprocess.run(command, capture_output=True, text=True)
+    return pixel_batch_statuses(result, len(paths)), result
 
 
 def run_pixel_batch(renderer, backend, shader, cases):
@@ -3976,7 +3980,6 @@ def check_predicate_draws(directory, compiler, renderer, backend):
 
 def check_int_predicate_draws(directory, compiler, renderer, backend):
     source = directory / "int_predicates.hlsl"
-    shader = directory / "int_predicates.cso"
     # Normal and signed-zero IEEE-754 bit patterns avoid denormal/NaN canonicalization while covering
     # signed/unsigned order flips (-0.0 vs +0.0, +1.0 vs -1.0) and integer-vs-float order (-2.0 vs -1.0).
     pairs = (
@@ -3994,9 +3997,11 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
             left_v, right_v = left_u, right_u
         return 0 if left_v < right_v else (1 if left_v == right_v else 2)
 
+    draws = []
     for kind in ("i32", "u32"):
         for encoding in ("e32", "e64"):
             for first in (0, 4):
+                shader = directory / f"int_predicates-{kind}-{encoding}-{first}.cso"
                 source.write_text(translate(int_predicate_group(kind, encoding, first)), encoding="ascii")
                 compile_shader(compiler, source, shader)
                 cases = []
@@ -4017,11 +4022,18 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
                     wrong = directory / f"int_predicates-{kind}-{encoding}-{first}-unsigned-reference.case"
                     wrong.write_bytes(constants + wrong_pixel * 64)
                     cases.insert(-1, (wrong, "mismatch"))
-                try:
-                    run_pixel_batch(renderer, backend, shader, cases)
-                except AssertionError as error:
-                    error.add_note(f"Integer predicate draw on {backend}, {kind} {encoding} first={first}")
-                    raise
+                draws.extend((shader, case, status) for case, status in cases)
+
+    # Relative input names keep the Windows command line short even under a long temp path.
+    # Resolve an explicitly supplied executable before changing its working directory.
+    executable = Path(renderer).resolve() if Path(renderer).is_file() else None
+    paths = [name for shader, case, _ in draws for name in (shader.name, case.name)]
+    result = subprocess.run([renderer, backend, "--check-pixel-pairs", *paths], cwd=directory,
+                            executable=executable, capture_output=True, text=True)
+    for (shader, case, expected), actual in zip(draws, pixel_batch_statuses(result, len(draws))):
+        if actual != expected:
+            raise AssertionError(f"{backend}: {shader.name} / {case.name}: expected {expected}, got {actual}\n"
+                                 f"{result.stdout}\n{result.stderr}")
 
 
 def check_unsigned_less_than_draws(directory, compiler, renderer, backend):

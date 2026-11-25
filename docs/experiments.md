@@ -7280,15 +7280,15 @@ sets the process exit code to 1. The remaining pairs still report a status.
 Run `ctest --preset dev --no-tests=error -R '^pixel_batch_pairs_(hardware|warp)$' -V`
 to compare two shaders with isolated draws and exercise mismatch and missing-file controls.
 
-The 32-bit integer, 16-bit integer and SDWA predicate draws use the same
-runner, one batch per compiled group, with the same references. The
-signed-against-unsigned control of the first `i32` e32 group and the
-inverted-unordered control of each SDWA group run inside their batch as
-expected mismatches, each followed by a passing draw. The three 16-bit
-`must_mismatch` controls, two of them on mutated shaders, keep one single-case
-draw each. These three suites
-go from 108 device creations to 23, and DXC compiles one shader fewer, because
-the signed/unsigned control now reuses the group's compiled shader.
+The 32-bit integer predicate fixture passes eight compiled shaders and 33
+references to one `--check-pixel-pairs` process. The signed-against-unsigned
+reference in the first `i32` e32 group must mismatch, and the following draw
+must pass. Each 16-bit integer or SDWA predicate group uses a single-shader
+batch. Each SDWA inverted-unordered control still precedes a passing draw.
+The three 16-bit `must_mismatch` controls use one single-case draw each.
+The original per-shader batching cut device creations across these three
+suites from 108 to 23 and saved one compile by reusing the signed shader.
+Combining the eight 32-bit groups saves seven more device creations.
 
 The remaining multi-case `--check-pixel-case` loops across `draw-core`,
 `draw-predicate-rounding`, `draw-blend-scalar`, `draw-e64`, `draw-integer-nc`,
