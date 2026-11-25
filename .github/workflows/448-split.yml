@@ -1,7 +1,7 @@
-name: Compare actual integer-predicate inputs and readbacks before and after device reuse
+name: Verify the reviewer's mesh preflight and actual predicate draw on Windows Release
 on:
   push:
-    branches: ['verify/448-predicate-draws']
+    branches: ['verify/2541-review-release']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
         with:
           path: out/harness
           persist-credentials: false
-      - name: Build the Debug renderer and run the WARP fixtures with the debug layer
+      - name: Check both mesh invocations, build Release and run the predicate WARP fixture
         shell: pwsh
         run: |
           ./tools/dev.ps1
@@ -31,20 +31,29 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset dev -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebug
+          foreach ($root in '.','out/predicate-base') {
+            $script = Join-Path $root 'tests/mesh_entry_check.py'
+            $failure = out/pe-env/Scripts/python.exe -B $script 2>&1
+            if ($LASTEXITCODE -ne 1 -or -not ($failure -match 'IndexError: list index out of range')) {throw "Different argumentless result in $root"}
+            foreach ($mode in 'skipped','flat-scratch') {
+              out/pe-env/Scripts/python.exe -B $script $mode
+              if ($LASTEXITCODE) {throw "Failed $mode on $root"}
+            }
+          }
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset dev --target offscreen_check
+          cmake --build --preset release --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory out/pixel-timing
-          $build = 'out/build/dev'
+          $build = 'out/build/release'
           Copy-Item "$build/offscreen_check.exe" -Destination $stage
-          $rows = ctest --preset dev -V -j 1 --no-tests=error --output-junit "$stage/results.xml" -R '^(pixel_aot_comparisons_warp|pixel_batch_(pairs|debug|removal)_warp)$' 2>&1
+          $rows = ctest --preset release -V -j 1 --no-tests=error --output-junit "$stage/results.xml" -R '^(pixel_aot_comparisons_warp|mesh_entry_(skipped_scalar|flat_scratch)_cpu)$' 2>&1
           $rc = $LASTEXITCODE
           $rows | Set-Content "$stage/ctest.log"
           $rows | Select-Object -Last 12
           [xml]$junit = Get-Content -Raw "$stage/results.xml"
           $cases = @($junit.testsuite.testcase)
-          if ($rc -or $cases.Count -ne 4 -or @($cases | Where-Object status -ne 'run').Count) {throw "CTest exited $rc"}
+          if ($rc -or $cases.Count -ne 3 -or @($cases | Where-Object status -ne 'run').Count) {throw "CTest exited $rc"}
           Copy-Item "$build/form_coverage/pixel_aot_comparisons_warp.txt" -Destination $stage
           $dxc = (Get-Command dxc.exe).Source
           $renderer = (Resolve-Path "$build/offscreen_check.exe").Path
@@ -58,7 +67,7 @@ jobs:
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: predicate-draws-dev
+          name: predicate-review-release
           path: out/pixel-timing/
           if-no-files-found: error
           retention-days: 2
