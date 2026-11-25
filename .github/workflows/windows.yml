@@ -1,10 +1,10 @@
-name: Measure startup MRT fixture on Windows
+name: Compare checked MRT refusals on Windows
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
   timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/measure/startup-mrt-timing'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/mrt-pending-retries'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -32,21 +32,39 @@ jobs:
           }
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          name: startup-mrt-source-build
-          path: out/mrt-artifact/
-          retention-days: 2
-          if-no-files-found: error
-      - name: Measure FXC and DXC with the original fixture assertions
+          path: candidate
+          ref: 15305680f7c90aff2c0dbd3eefdbad0f961384e4
+          persist-credentials: false
+      - name: Compare full MRT profiles on the same WARP runner
         shell: pwsh
         run: |
           ./tools/dev.ps1
+          $python = (Resolve-Path out/pe-env/Scripts/python.exe).Path
           $consumer = (Resolve-Path out/mrt-artifact/startup_stream_consumer.exe).Path
           $dxc = ((Select-String out/mrt/CMakeCache.txt -Pattern '^DXC_EXECUTABLE:FILEPATH=').Line -split '=',2)[1]
           $fxc = ((Select-String out/mrt/CMakeCache.txt -Pattern '^STARTUP_FXC:FILEPATH=').Line -split '=',2)[1]
-          foreach ($kind in 'fxc','dxc','dxc','fxc') {
-            $report = "out/mrt-$kind.json"
-            out/pe-env/Scripts/python.exe -B tests/measure_startup_mrt.py $consumer warp $kind $dxc $fxc $report
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item tests/measure_startup_mrt.py candidate/tests/measure_startup_mrt.py
+          foreach ($kind in 'fxc','dxc') {
+            $reference = @()
+            $trial = 0
+            foreach ($version in 'baseline','candidate','candidate','baseline') {
+              $trial++
+              $dir = if ($version -eq 'baseline') { '.' } else { 'candidate' }
+              $report = (Join-Path (Resolve-Path out) "timing-$kind-$trial.json")
+              $lines = & $python -B "$dir/tests/measure_startup_mrt.py" $consumer warp $kind $dxc $fxc $report 2>&1
+              $rc = $LASTEXITCODE
+              if ($rc) { $lines | Select-Object -Last 20; throw "MRT exit $rc" }
+              $summaries = @($lines | Where-Object { "$_".StartsWith("$kind warp ") } | ForEach-Object { "$_" })
+              if ($summaries.Count -ne 12) { throw "Missing MRT summary ($($summaries.Count))" }
+              if ($reference.Count -eq 0) { $reference = $summaries }
+              if (($summaries -join "`n") -cne ($reference -join "`n")) { throw 'MRT readback summaries differ' }
+              $retries = @($lines | Select-String -Pattern ': unsupported: unverified (UINT|SINT) RTV format').Count
+              $wanted = if ($version -eq 'baseline') { 64 } else { 0 }
+              if ($retries -ne $wanted) { throw "Observed $retries repeats, expected $wanted" }
+              $result = Get-Content $report -Raw | ConvertFrom-Json
+              if ($result.debug.Count -ne 1 -or $result.debug[0] -notmatch ' enabled$') { throw 'Debug layer unavailable' }
+              Write-Host "MRT_RESULT $version $trial retries=$retries $(Get-Content $report -Raw | ConvertFrom-Json | ConvertTo-Json -Compress -Depth 5)"
+            }
           }
