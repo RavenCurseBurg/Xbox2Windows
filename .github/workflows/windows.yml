@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 92e06cceda6b461e24a8e9b70c408bc2b6435c1c
+          ref: 4cbd57e754f672c3de840f235dba6b2dd579ddef
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -22,13 +22,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer startup_indirect_dispatch
+          cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory -Force out/mrt-artifact
           foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','startup_indirect_dispatch.exe') {
-            $files = @(Get-ChildItem out/mrt -File -Recurse -Filter $name)
+            $files = @(Get-ChildItem out/build/release -File -Recurse -Filter $name)
             if ($files.Count -ne 1) { throw "Expected one built $name" }
             Copy-Item -LiteralPath $files[0].FullName -Destination $stage
           }
@@ -40,18 +40,18 @@ jobs:
           path: out/mrt-artifact/
           retention-days: 2
           if-no-files-found: error
-      - name: Verify the two parent fixtures on WARP
+      - name: Run the new and existing dispatch fixtures on WARP
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt --no-tests=error -V -R '^startup_(compute_dispatch|indirect_dispatch)_warp$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(slot67_indirect_dispatch|compute_dispatch|indirect_dispatch|indirect_count|indirect_root_constants)_warp$' 2>&1
           $result=$LASTEXITCODE
-          $rows | Tee-Object -FilePath out/parent-warp.log | Select-Object -Last 12
-          if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a parent check, exit $result"}
+          $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
+          if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: slot67-results
-          path: out/parent-warp.log
+          path: out/slot67-warp.log
           if-no-files-found: ignore
           retention-days: 2
