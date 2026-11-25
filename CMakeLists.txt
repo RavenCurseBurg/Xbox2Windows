@@ -3978,6 +3978,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot67_indirect_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" "${adapter}")
         set_tests_properties(startup_slot67_indirect_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_live_retry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_compute_live_retry_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"

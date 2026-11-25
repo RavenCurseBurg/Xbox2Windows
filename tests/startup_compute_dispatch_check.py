@@ -51,20 +51,27 @@ def lines(result, text):
     return [line for line in result.stderr.splitlines() if text in line]
 
 
+def prepare_case(directory, adapter):
+    cache, env = prepare(directory)
+    env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
+    if adapter == 'hardware':
+        env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
+    else:
+        env.pop('X2W_TEST_DISPATCH_HARDWARE', None)
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    _, words, rsrc2, group, groups = C.CASES['A']
+    assert groups == (3, 2, 2) and (C.KEY, C.STRIDE) == (0x01234567, 0x9e3779b9), 'the consumer hard-codes case A'
+    (directory / 'program').write_bytes(words)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    return cache, env
+
+
 def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
-        cache, env = prepare(directory)
-        env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
-        if adapter == 'hardware':
-            env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
-        (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
-        env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
-        _, words, rsrc2, group, groups = C.CASES['A']
-        assert groups == (3, 2, 2) and (C.KEY, C.STRIDE) == (0x01234567, 0x9e3779b9), 'the consumer hard-codes case A'
-        (directory / 'program').write_bytes(words)
-        (directory / 'data').write_bytes(DATA)
-        (directory / 'state').write_bytes(state_a(group, rsrc2))
+        cache, env = prepare_case(directory, adapter)
         untouched, expected = [C.SENTINEL] * C.WORDS, C.expected('A')
         assert expected != untouched
 
