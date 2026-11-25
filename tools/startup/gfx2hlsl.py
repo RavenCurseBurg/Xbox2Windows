@@ -4361,6 +4361,51 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, True)
 
+    def cube(self, kind, ops, mods):
+        """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
+
+        The major axis is z when |z| is at least |x| and |y|, otherwise y when |y| is at
+        least |x|, otherwise x. A face is negative only for a nonzero, non-NaN negative
+        coordinate. cubema returns twice the signed major coordinate.
+        """
+        if len(ops) != 4:
+            raise Unsupported('v_cube%s_f32 with %d operands, expected 4' % (kind, len(ops)))
+        if any(m != 'clamp' for m in mods):
+            raise Unsupported('v_cube%s_f32 with %s' % (kind, ', '.join(mods)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] or dst[2] > 255:
+            raise Unsupported('v_cube%s_f32 destination %s' % (kind, ops[0]))
+        x, y, z = [self.f(o) for o in ops[1:4]]
+        temp = 'cube%d' % getattr(self, 'cube_temps', 0)
+        self.cube_temps = getattr(self, 'cube_temps', 0) + 1
+        self.emit('float3 %s = float3(%s, %s, %s);' % (temp, x, y, z))
+        c = temp
+        a = 'abs(%s)' % c
+        zmajor = '(%s.z >= %s.x && %s.z >= %s.y)' % (a, a, a, a)
+        ymajor = '(%s.y >= %s.x)' % (a, a)
+        expression = {
+            'id': '(%s ? (%s.z < 0.0f ? 5.0f : 4.0f) : %s ? (%s.y < 0.0f ? 3.0f : 2.0f) '
+                  ': (%s.x < 0.0f ? 1.0f : 0.0f))' % (zmajor, c, ymajor, c, c),
+            'sc': '(%s ? (%s.z < 0.0f ? -%s.x : %s.x) : %s ? %s.x '
+                  ': (%s.x < 0.0f ? %s.z : -%s.z))' % (zmajor, c, c, c, ymajor, c, c, c, c),
+            'tc': '(%s ? -%s.y : %s ? (%s.y < 0.0f ? -%s.z : %s.z) : -%s.y)' % (
+                zmajor, c, ymajor, c, c, c, c),
+            'ma': '((%s ? %s.z : %s ? %s.y : %s.x) * 2.0f)' % (zmajor, c, ymajor, c, c),
+        }[kind]
+        self.set_vf(dst[1], expression, mods)
+
+    def op_v_cubeid_f32(self, ops, mods):
+        self.cube('id', ops, mods)
+
+    def op_v_cubesc_f32(self, ops, mods):
+        self.cube('sc', ops, mods)
+
+    def op_v_cubetc_f32(self, ops, mods):
+        self.cube('tc', ops, mods)
+
+    def op_v_cubema_f32(self, ops, mods):
+        self.cube('ma', ops, mods)
+
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
         pair = reg_range(tok)

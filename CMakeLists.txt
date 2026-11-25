@@ -2978,6 +2978,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers s_bitcmp1_b32 and s_bitcmp0_b32 (SOPC): CPU evaluation of the translated SCC test.
     add_test(NAME startup_gfx2hlsl_s_bitcmp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitcmp_check.py")
+    # gfx2hlsl lowers v_cube{id,sc,tc,ma}_f32: device-free translation controls.
+    add_test(NAME startup_gfx2hlsl_cube_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py")
     # gfx2hlsl.py --watch consumes only ready requests and does not retry an unchanged failure.
     add_test(NAME startup_gfx2hlsl_watch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_watch_check.py")
@@ -3294,6 +3297,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_bit_alu_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_bit_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl v_cube{id,sc,tc,ma}_f32: the source-built cube directions are drawn and compared with the
+    # LLVM ConstantFoldAMDGCNCubeIntrinsic model; swapped id/sc, tie-order and cubema-factor controls must fail.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_cube_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_cube_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl v_interp_p1ll_f16 / v_interp_p2_f16 (#1996): translation controls with a high-half inversion
     # control, then a desktop draw of the translated pair with DXC 6_0.

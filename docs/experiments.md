@@ -7574,6 +7574,21 @@ Build `offscreen_check`, then run
 `ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_mul_hi_' -V`.
 [Refs #1792](https://github.com/R0Y00/Xbox2Windows/issues/1792)
 
+**Cube coordinate operations.** Startup translation now lowers `v_cubeid_f32`,
+`v_cubesc_f32`, `v_cubetc_f32` and `v_cubema_f32` (VOP3A) with the same
+major-axis rule as LLVM's `ConstantFoldAMDGCNCubeIntrinsic`: z wins when
+`|z| >= |x|` and `|z| >= |y|`, otherwise y wins when `|y| >= |x|`, otherwise
+x. A face is negative only for a nonzero, non-NaN negative coordinate, and
+`v_cubema_f32` returns twice the signed major coordinate. The source-built
+fixture covers all six faces, the y/x and z/x ties, and `-0.0` on the major axis.
+The draw compares all four result words on WARP and hardware; a swapped id/sc,
+a changed tie order and a dropped `* 2.0f` factor must each mismatch. The
+translation controls also cover `clamp`, source neg/abs, a missing operand, a
+vector destination and unsupported modifiers. NaN coordinates are not drawn.
+Build `offscreen_check`, then run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cube' -V`.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
+
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
