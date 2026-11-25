@@ -1,20 +1,21 @@
-name: Build the two-SRV guest graphics fixture
+name: Verify fixed comparison sampler border readbacks
 on:
   push:
-    branches: ['verify/graphics-joined-table']
+    branches: ['verify/comparison-sampler-border']
 permissions:
   contents: read
 jobs:
-  timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/graphics-joined-table'
+  verify:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 3d1a9d32afa1deab874137de1e8e2eeab773b5b2
+          repository: R0Y00/Xbox2Windows
+          ref: 34b74000af157a0de922d680a46b89016cd3ac26
           persist-credentials: false
-      - name: Build the stream consumer and collect source digests
+      - name: Build and package the renderer
         shell: pwsh
         run: |
           ./tools/dev.ps1
@@ -22,42 +23,35 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --preset dev -B out/W -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer
+          cmake --build out/W --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe') {
-            $files = @(Get-ChildItem out/mrt -File -Recurse -Filter $name)
-            if ($files.Count -ne 1) { throw "Expected one built $name" }
-            Copy-Item -LiteralPath $files[0].FullName -Destination $stage
-          }
+          $stage = New-Item -ItemType Directory -Force out/border-artifact
+          Copy-Item out/W/offscreen_check.exe -Destination $stage
+          if (Test-Path out/W/D3D12) { Copy-Item out/W/D3D12 -Recurse -Destination $stage }
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
-          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+          Get-ChildItem $stage -File -Recurse | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: joined-table-consumer
-          path: out/mrt-artifact/
+          name: border-renderer
+          path: out/border-artifact/
           retention-days: 2
-          if-no-files-found: error
-      - name: Run the guest table readback with both compilers
+      - name: Verify CPU and WARP outputs with both compilers
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_joined_table_pointer_(cpu|(fxc|dxc)_warp)$' 2>&1
-          $rc=$LASTEXITCODE
-          $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
-          foreach ($kind in 'fxc','dxc') {
-            foreach ($change in 0,32) {
-              $seen=@($rows | Select-String -Pattern "$kind warp table byte (0|32), $change pixels changed from the source expectation")
-              if ($seen.Count -ne 5) {throw "Expected five $kind readbacks with $change changed pixels, got $($seen.Count)"}
-            }
+          $rows = ctest --test-dir out/W --no-tests=error -V -R '^startup_image_sample_c_border_(controls|warp)$' 2>&1
+          $rc = $LASTEXITCODE
+          $rows | Set-Content out/border.log
+          $rows | Select-Object -Last 10
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') { throw "Incomplete CTest ($rc)" }
+          foreach ($kind in 'dxc','fxc') {
+            if (@($rows | Select-String "$kind mutant .* caught").Count -ne 4) { throw "Expected four $kind mutation results" }
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: joined-table-ctest
-          path: out/graphics-table.log
-          if-no-files-found: ignore
+          name: border-log
+          path: out/border.log
           retention-days: 2
