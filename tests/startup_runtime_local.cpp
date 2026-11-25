@@ -35,7 +35,9 @@ void fixture_logf(const char* format, ...)
 
 #define GetProcAddress fixture_get_proc_address
 #define logf fixture_logf
+#define X2W_RUNTIME_PROXY_FIXTURE 1
 #include "../src/startup_stubs/runtime_proxy.cpp"
+#undef X2W_RUNTIME_PROXY_FIXTURE
 #undef logf
 #undef GetProcAddress
 

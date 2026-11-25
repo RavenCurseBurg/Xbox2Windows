@@ -16,10 +16,10 @@
 // The page starts as a sentinel pattern. Sentinel, R1 and R2 prefixes and V differ at every byte of the
 // destination, so one byte tells which of them a consumer is looking at.
 // Checked:
-//   - at R1's fence: entry 0 is E_FAIL and the page is still every byte its sentinel;
-//   - at V's fence: entry 1 is S_OK, entry 0 is still E_FAIL (a later success does not rewrite an earlier
+//   - at R1's fence: entry 0 is ERROR_INSUFFICIENT_BUFFER and the page is still every byte its sentinel;
+//   - at V's fence: entry 1 is S_OK, entry 0 is still ERROR_INSUFFICIENT_BUFFER (a later success does not rewrite an earlier
 //     failure's status), and the destination holds exactly V's bytes, the sentinel below 0xF000;
-//   - at R2's fence: entry 2 is E_FAIL, entries 0 and 1 are unchanged, and the page is byte-identical to
+//   - at R2's fence: entry 2 is ERROR_INSUFFICIENT_BUFFER, entries 0 and 1 are unchanged, and the page is byte-identical to
 //     what it was at V's fence (the bounded refusal wrote nothing, not even a prefix);
 //   - fences run in queue order, each after its own status entry;
 //   - the stand-in's log names "destination capacity exceeded", "inflated", "destination capacity exceeded".
@@ -315,7 +315,7 @@ int main(int argc, char** argv)
     if (!expect(all_signaled, "a fence of the sequence was never signaled")) return 1;
 
     // Status at each fence: entries up to it are complete with their final result, later ones are not.
-    const long result[slot_count] = {E_FAIL, S_OK, E_FAIL};
+    const long result[slot_count] = {HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), S_OK, HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)};
     const char* const name[slot_count] = {"R1", "V", "R2"};
     bool ok = true;
     for (unsigned slot = 0; slot < slot_count; ++slot) {
@@ -379,7 +379,7 @@ int main(int argc, char** argv)
     VirtualFree(view, 0, MEM_RELEASE);
     DeleteFileW(log_path);
     if (!ok) return 1;
-    std::puts("R1 reported E_FAIL and left its page the sentinel; V then replaced the destination with its exact bytes "
-              "while R1's status stayed E_FAIL; R2 reported E_FAIL and left V's bytes untouched, with no stream prefix");
+    std::puts("R1 reported ERROR_INSUFFICIENT_BUFFER and left its page the sentinel; V then replaced the destination with its exact bytes "
+              "while R1's status stayed ERROR_INSUFFICIENT_BUFFER; R2 reported ERROR_INSUFFICIENT_BUFFER and left V's bytes untouched, with no stream prefix");
     return 0;
 }

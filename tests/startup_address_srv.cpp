@@ -531,3 +531,98 @@ int draw_single_element_srvs(void* guest, void* list)
     publish(aligned, view_of(aligned, ptr(memory[0]))); draw(7);
     return 0;
 }
+
+// Exercise runtime bound-SRV format validation and d16unorm16 mode selection on a shader carrying
+// 'd16srv 0 exact' and 'udsrc 3 d16unorm16 0' (#2023):
+// - col 0: R16_UNORM (0xffef) + explicit R16_UNORM SRV -> d16unorm16=1 gives exact 0x3bff (yellow 255, 255, 0)
+// - col 1: R32_FLOAT (0x3f7ff000 = binary32(0xffef/65535)) + default SRV -> d16unorm16=0 gives 0x3c00 (red 255, 0, 0)
+// - col 2: R16_TYPELESS (0xaaaa) + explicit R16_UNORM SRV -> d16unorm16=1 gives 0x3955 (170, 0, 0)
+// - cols 3..6: R16_UINT, R16_SNORM, null-resource SRV and unwritten descriptor -> refused (clear blue 0, 0, 255)
+// - col 7: rebind R16_UNORM (0xffef) + default SRV -> d16unorm16=1 recovers cleanly (yellow 255, 255, 0)
+int draw_d16_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    D3D12_RESOURCE_DESC probe16{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1,
+        DXGI_FORMAT_R16_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_RESOURCE_DESC probe32 = probe16;
+    probe32.Format = DXGI_FORMAT_R32_FLOAT;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp16{}, fp32{};
+    UINT64 total16 = 0, total32 = 0;
+    desktop->GetCopyableFootprints(&probe16, 0, 1, 0, &fp16, nullptr, nullptr, &total16);
+    desktop->GetCopyableFootprints(&probe32, 0, 1, 0, &fp32, nullptr, nullptr, &total32);
+    if (!total16 || total16 == ~UINT64{0} || !total32 || total32 == ~UINT64{0}) return 48;
+
+    static std::array<std::vector<unsigned char>, 5> planes;
+    const DXGI_FORMAT resource_formats[5] = {
+        DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R16_TYPELESS,
+        DXGI_FORMAT_R16_UINT,
+        DXGI_FORMAT_R16_SNORM,
+    };
+    const std::uint16_t u16_unorm = 0xffefu, u16_typeless = 0xaaaau, u16_uint = 200u, u16_snorm = 0x4000u;
+    const std::uint32_t f32_bits = 0x3f7ff000u;  // binary32(65519 / 65535.0): rounds to 0x3c00 under pack16_rne
+    void* textures[5]{};
+    for (int i = 0; i < 5; ++i) {
+        const bool is32 = i == 1;
+        const UINT64 total = is32 ? total32 : total16;
+        const UINT64 offset = is32 ? fp32.Offset : fp16.Offset;
+        planes[i].assign(static_cast<std::size_t>(total), 0);
+        if (i == 0) std::memcpy(planes[i].data() + offset, &u16_unorm, sizeof(std::uint16_t));
+        else if (i == 1) std::memcpy(planes[i].data() + offset, &f32_bits, sizeof(std::uint32_t));
+        else if (i == 2) std::memcpy(planes[i].data() + offset, &u16_typeless, sizeof(std::uint16_t));
+        else if (i == 3) std::memcpy(planes[i].data() + offset, &u16_uint, sizeof(std::uint16_t));
+        else std::memcpy(planes[i].data() + offset, &u16_snorm, sizeof(std::uint16_t));
+        auto desc = is32 ? probe32 : probe16;
+        desc.Format = resource_formats[i];
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(planes[i].data()), ptr(&desc),
+                                               D3D12_RESOURCE_STATE_COMMON, 0,
+                                               ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i])))))
+            return 49;
+    }
+
+    struct Extended {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 9, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap)))))
+        return 42;
+    const Word cpu = invoke(heap, 9);
+    const Word gpu = invoke(heap, 10);
+    const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (!cpu || !gpu || stride < 32) return 42;
+    invoke(list, 32, 1, ptr(&heap));
+
+    const auto make_view = [](DXGI_FORMAT fmt) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        return v;
+    };
+    const auto v_unorm = make_view(DXGI_FORMAT_R16_UNORM);
+    const auto v_uint = make_view(DXGI_FORMAT_R16_UINT);
+    const auto v_snorm = make_view(DXGI_FORMAT_R16_SNORM);
+
+    invoke(guest, 18, ptr(textures[0]), ptr(&v_unorm), cpu + 0 * stride);  // 0: R16_UNORM (0xffef) + explicit R16_UNORM
+    invoke(guest, 18, ptr(textures[1]), 0,             cpu + 1 * stride);  // 1: R32_FLOAT (0x3f7ff000) + default SRV
+    invoke(guest, 18, ptr(textures[2]), ptr(&v_unorm), cpu + 2 * stride);  // 2: R16_TYPELESS (0xaaaa) + explicit R16_UNORM
+    invoke(guest, 18, ptr(textures[2]), ptr(&v_uint),  cpu + 3 * stride);  // 3: R16_TYPELESS + explicit R16_UINT (refused)
+    invoke(guest, 18, ptr(textures[3]), 0,             cpu + 4 * stride);  // 4: R16_UINT + default SRV (refused)
+    invoke(guest, 18, ptr(textures[4]), ptr(&v_snorm), cpu + 5 * stride);  // 5: R16_SNORM + explicit R16_SNORM (refused)
+    invoke(guest, 18, 0,                ptr(&v_unorm), cpu + 6 * stride);  // 6: null resource SRV (refused)
+    // Slot 7 is intentionally left unwritten (missing view token -> refused).
+    invoke(guest, 18, ptr(textures[0]), 0,             cpu + 8 * stride);  // 8: R16_UNORM (0xffef) + default SRV
+
+    const auto draw_at = [&](LONG x, UINT slot) {
+        invoke(list, 36, 0, gpu + Word{slot} * stride);
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    for (UINT col = 0; col < 7; ++col) draw_at(static_cast<LONG>(col), col);
+    draw_at(6, 7);  // Also test unwritten descriptor slot on column 6; must stay clear.
+    draw_at(7, 8);  // Rebind R16_UNORM default SRV on column 7; must draw yellow (0x3bff) cleanly.
+    return 0;
+}

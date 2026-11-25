@@ -2,20 +2,27 @@
 //
 // The title's static runtime library loads the system xgameruntime.dll and asks it for API objects
 // with QueryApiImpl(provider GUID, interface GUID, &object). With X2W_RUNTIME_PROXY=1 this file (built
-// into the GameInput stand-in, which the title imports) patches the title's import of GetProcAddress
-// so that the lookup of "QueryApiImpl" returns a wrapper. The wrapper hands out proxy objects whose
-// methods log their first calls ("x2w-runtime") and forward to the real object.
+// into the GameInput stand-in, which the title imports) rewrites GetProcAddress and a direct
+// xgameruntime.dll!QueryApiImpl import on the main EXE and on DLLs that share the EXE's directory
+// (package helpers). Dynamic QueryApiImpl is wrapped only when the provider module's basename is
+// xgameruntime.dll. The pre-link load notification only requests another scan. A worker scans
+// and rewrites linked modules outside the notification, keeping each module live while it is patched.
+// Enabled proxies remain loaded until process exit. Delay-import IAT slots are not
+// rewritten. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
+// and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
 #include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/runtime_gpa_patch.h"
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
 #include "startup_stubs/storage_root.h"
 #include "startup_stubs/storage_root_utf8.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +32,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <psapi.h>
 
 namespace {
 using u64 = std::uint64_t;
@@ -47,7 +56,29 @@ SRWLOCK proxy_lock = SRWLOCK_INIT;
 void* slot_table[max_slots];
 
 using QueryApi = HRESULT(__stdcall*)(const GUID*, const GUID*, void**);
-QueryApi real_query;
+// Written from the GPA hook and the post-link scan; first non-null wins.
+std::atomic<QueryApi> real_query{nullptr};
+
+bool keep_forward_target(FARPROC target) noexcept
+{
+#if defined(X2W_RUNTIME_PROXY_FIXTURE)
+    return target != nullptr;
+#else
+    HMODULE module = nullptr;
+    return target && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                        reinterpret_cast<LPCWSTR>(target), &module);
+#endif
+}
+
+bool remember_real_query(QueryApi query) noexcept
+{
+    QueryApi expected = real_query.load(std::memory_order_acquire);
+    if (expected) return expected == query;
+    if (!keep_forward_target(reinterpret_cast<FARPROC>(query))) return false;
+    return real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel) || expected == query;
+}
+
+QueryApi load_real_query() noexcept { return real_query.load(std::memory_order_acquire); }
 
 // ---- local user (X2W_FAKE_USER=1) ----------------------------------------------------------
 // The user API object is the provider whose GUID starts 01acd177 (seen: called at start-up and when
@@ -293,7 +324,9 @@ void fill_slots(std::index_sequence<I...>)
 
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
-    const HRESULT hr = real_query(provider, iid, out);
+    const QueryApi query = load_real_query();
+    if (!query) return E_FAIL;
+    const HRESULT hr = query(provider, iid, out);
     const bool output_writable = FAILED(hr) && fake_user() && x2w_local::writable(out, sizeof(*out));
     const bool pair_readable = output_writable && x2w_local::readable(provider, sizeof(*provider)) &&
                                x2w_local::readable(iid, sizeof(*iid));
@@ -382,20 +415,89 @@ u64 __stdcall proxy_init(u64 a, u64 b, u64 c, u64 d)
     return 0;
 }
 
+HMODULE proxy_module;  // this DLL; its own GetProcAddress IAT must stay real or the hook recurses
+
+bool wide_eq_ascii_ci(const wchar_t* wide, const char* ascii) noexcept
+{
+    if (!wide || !ascii) return false;
+    for (;; ++wide, ++ascii) {
+        const wchar_t w = *wide;
+        const unsigned char a = static_cast<unsigned char>(*ascii);
+        if (!w && !a) return true;
+        if (!w || !a) return false;
+        const wchar_t wl = (w >= L'A' && w <= L'Z') ? static_cast<wchar_t>(w - L'A' + L'a') : w;
+        const wchar_t al = (a >= 'A' && a <= 'Z') ? static_cast<wchar_t>(a - 'A' + 'a') : static_cast<wchar_t>(a);
+        if (wl != al) return false;
+    }
+}
+
+const wchar_t* path_basename(const wchar_t* path) noexcept
+{
+    const wchar_t* base = path;
+    for (const wchar_t* p = path; p && *p; ++p)
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+    return base;
+}
+
+bool module_basename_is(HMODULE module, const char* expect) noexcept
+{
+    wchar_t path[MAX_PATH]{};
+    if (!module) return false;
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
+    return wide_eq_ascii_ci(path_basename(path), expect);
+}
+
+#if defined(X2W_RUNTIME_PROXY_FIXTURE)
+// startup_runtime_local stubs GetProcAddress and passes a null module; skip the basename gate there.
+bool module_is_xgameruntime(HMODULE) noexcept { return true; }
+#else
+bool module_is_xgameruntime(HMODULE module) noexcept { return module_basename_is(module, "xgameruntime.dll"); }
+#endif
+
+// EXE and DLLs that sit next to it (the package/run folder). System and injector modules are out of scope.
+bool module_is_exe_or_package_helper(HMODULE module) noexcept
+{
+    if (!module) return false;
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    if (module == exe) return true;
+    wchar_t exe_path[MAX_PATH]{}, mod_path[MAX_PATH]{};
+    const DWORD exe_length = GetModuleFileNameW(exe, exe_path, MAX_PATH);
+    const DWORD mod_length = GetModuleFileNameW(module, mod_path, MAX_PATH);
+    if (!exe_length || exe_length >= MAX_PATH || !mod_length || mod_length >= MAX_PATH) return false;
+    wchar_t* exe_slash = nullptr;
+    for (wchar_t* p = exe_path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') exe_slash = p;
+    wchar_t* mod_slash = nullptr;
+    for (wchar_t* p = mod_path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') mod_slash = p;
+    if (!exe_slash || !mod_slash) return false;
+    const std::size_t exe_dir = static_cast<std::size_t>(exe_slash - exe_path);
+    const std::size_t mod_dir = static_cast<std::size_t>(mod_slash - mod_path);
+    if (exe_dir != mod_dir) return false;
+    for (std::size_t i = 0; i < exe_dir; ++i) {
+        wchar_t a = exe_path[i], b = mod_path[i];
+        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
 {
     const FARPROC real = GetProcAddress(module, name);
     if (real && reinterpret_cast<u64>(name) > 0xffff) {
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
-        if (std::strcmp(name, "QueryApiImpl") == 0) {
-            real_query = reinterpret_cast<QueryApi>(real);
+        // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
+        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
+            remember_real_query(reinterpret_cast<QueryApi>(real)))
             return reinterpret_cast<FARPROC>(&proxy_query);
-        }
-        if (runtime_local() && fake_user()) {
+        if (runtime_local() && fake_user() && module_is_xgameruntime(module)) {
             static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
             for (int k = 0; k < 3; ++k) {
-                if (std::strcmp(name, init_names[k]) != 0) continue;
+                if (std::strcmp(name, init_names[k]) != 0 || !keep_forward_target(real)) continue;
                 real_init[k] = reinterpret_cast<InitApi>(real);
                 return reinterpret_cast<FARPROC>(wrappers[k]);
             }
@@ -404,32 +506,171 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
     return real;
 }
 
-// Replaces the main module's import of GetProcAddress (by name) with the hook.
-void patch_imports()
+// Resolve QueryApiImpl from a loaded xgameruntime.dll without reading a delay-IAT thunk.
+void remember_real_query_from_export() noexcept
 {
-    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
+    if (!runtime || !module_is_xgameruntime(runtime)) return;
+    // This stand-in's own GetProcAddress IAT is left unpatched, so this is the real export lookup.
+    remember_real_query(reinterpret_cast<QueryApi>(GetProcAddress(runtime, "QueryApiImpl")));
+}
+
+// Rewrite one module's regular GetProcAddress / xgameruntime.dll!QueryApiImpl IAT slots.
+// Delay-import hits are not rewritten (slot is a delay thunk until first use). Caller must hold the
+// module live (pin) for the duration of the rewrite.
+int patch_module(HMODULE module)
+{
+    if (!module || !module_is_exe_or_package_helper(module)) return 0;
+    auto* base = reinterpret_cast<unsigned char*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!directory.VirtualAddress) return;
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    const auto image_size = static_cast<std::size_t>(nt->OptionalHeader.SizeOfImage);
+    const bool self = module == proxy_module;
     int patched = 0;
-    for (auto* import = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); import->Name; ++import) {
-        if (!import->OriginalFirstThunk) continue;
-        auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + import->OriginalFirstThunk);
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + import->FirstThunk);
-        for (; names->u1.AddressOfData; ++names, ++slots) {
-            if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
-            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-            if (std::strcmp(by_name->Name, "GetProcAddress") != 0) continue;
-            DWORD old = 0;
-            if (VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old)) {
-                slots->u1.Function = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
-                VirtualProtect(&slots->u1.Function, 8, old, &old);
+    x2w_runtime_patch::visit_imports(base, image_size, [&](const x2w_runtime_patch::Hit& hit) {
+        // Never rewrite this DLL's GetProcAddress: hooked_get_proc_address calls it for the real lookup.
+        if (self && hit.kind == x2w_runtime_patch::Kind::get_proc_address) return;
+        if (hit.delay_import) {
+            // Delay IAT holds a thunk, not the export. Do not rewrite; delay GetProcAddress is unhooked.
+            if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) remember_real_query_from_export();
+            return;
+        }
+        auto* slot = reinterpret_cast<ULONGLONG*>(base + hit.first_thunk_rva);
+        DWORD old = 0;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
+        if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
+            if (*slot != reinterpret_cast<ULONGLONG>(&hooked_get_proc_address)) {
+                *slot = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+                ++patched;
+            }
+        } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
+            // Regular import: slot holds the real export after the loader bound it.
+            if (*slot != reinterpret_cast<ULONGLONG>(&proxy_query) &&
+                remember_real_query(reinterpret_cast<QueryApi>(*slot))) {
+                *slot = reinterpret_cast<ULONGLONG>(&proxy_query);
                 ++patched;
             }
         }
+        VirtualProtect(slot, 8, old, &old);
+    });
+    return patched;
+}
+
+// Pin the module, rewrite after linking, then drop the pin. Safe outside LdrDllNotification.
+int patch_module_pinned(void* dll_base)
+{
+    if (!dll_base) return 0;
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(dll_base), &pinned) || !pinned)
+        return 0;
+    const int n = patch_module(pinned);
+    if (n > 0) {
+        char name[64] = "?";
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(pinned, path, MAX_PATH);
+        if (length && length < MAX_PATH) {
+            const wchar_t* base = path_basename(path);
+            const int keep = 60;
+            int i = 0;
+            for (; i < keep && base[i]; ++i) {
+                const wchar_t c = base[i];
+                name[i] = (c > 0 && c < 128) ? static_cast<char>(c) : '?';
+            }
+            name[i] = 0;
+        }
+        x2w_local::logf("x2w-runtime proxy: %d import(s) patched in package module %s", n, name);
     }
-    x2w_local::logf("x2w-runtime proxy: %d GetProcAddress import(s) of the main module patched", patched);
+    FreeLibrary(pinned);
+    return n;
+}
+
+using LdrDllNotification = void(CALLBACK*)(ULONG reason, const void* data, void* context);
+using LdrRegisterDllNotificationFn = LONG(NTAPI*)(ULONG flags, LdrDllNotification callback, void* context, void** cookie);
+constexpr ULONG ldr_dll_notification_reason_loaded = 1;
+// Keep the pre-link notification inside this module. One scan covers all still-loaded helpers,
+// so a burst needs no storage for module addresses and cannot overwrite pending work.
+std::atomic<bool> rescan_package_modules{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
+
+void CALLBACK dll_loaded(ULONG reason, const void*, void*)
+{
+    if (reason == ldr_dll_notification_reason_loaded)
+        rescan_package_modules.store(true, std::memory_order_release);
+}
+
+void patch_package_modules()
+{
+    std::vector<HMODULE> modules(512);
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) || !needed)
+        return;
+    if (needed > modules.size() * sizeof(HMODULE)) {
+        x2w_local::logf("x2w-runtime proxy: EnumProcessModules truncated (%u bytes needed, grew from %zu)",
+                        static_cast<unsigned>(needed), modules.size() * sizeof(HMODULE));
+        modules.resize(needed / sizeof(HMODULE) + 8);
+        needed = 0;
+        if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) ||
+            !needed)
+            return;
+        if (needed > modules.size() * sizeof(HMODULE)) {
+            x2w_local::logf("x2w-runtime proxy: EnumProcessModules still truncated (%u bytes needed for %zu slots); scanning first %zu",
+                            static_cast<unsigned>(needed), modules.size(), modules.size());
+            needed = static_cast<DWORD>(modules.size() * sizeof(HMODULE));
+        }
+    }
+    const unsigned count = needed / sizeof(HMODULE);
+    int modules_patched = 0, slots = 0, considered = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (!module_is_exe_or_package_helper(modules[i])) continue;
+        ++considered;
+        const int n = patch_module_pinned(modules[i]);
+        if (n > 0) {
+            ++modules_patched;
+            slots += n;
+        }
+    }
+    if (slots > 0 || considered > 0)
+        x2w_local::logf("x2w-runtime proxy: %d import(s) in %u of %u package module(s) (%u loaded scanned)", slots, modules_patched,
+                        considered, count);
+}
+
+// Patch the main EXE immediately. The load notice only requests another worker scan.
+// The worker pins and patches modules after linking. Package-directory helpers are in scope; other modules are not.
+void patch_imports()
+{
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    HMODULE pinned = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(exe), &pinned) && pinned) {
+        const int main_slots = patch_module(pinned);
+        x2w_local::logf("x2w-runtime proxy: %d import(s) of the main module patched", main_slots);
+        FreeLibrary(pinned);
+    }
+    static void* dll_cookie = nullptr;
+    static const LdrRegisterDllNotificationFn register_dll = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<LdrRegisterDllNotificationFn>(GetProcAddress(ntdll, "LdrRegisterDllNotification"))
+                     : nullptr;
+    }();
+    if (register_dll && !dll_cookie) {
+        const LONG status = register_dll(0, &dll_loaded, nullptr, &dll_cookie);
+        if (status != 0) x2w_local::logf("x2w-runtime proxy: LdrRegisterDllNotification failed 0x%08lx", static_cast<unsigned long>(status));
+    }
+    if (HANDLE worker = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        // Outside DllMain and the pre-link notification. Clear the request before each scan so
+        // loads that arrive during the scan are picked up on the next pass.
+        rescan_package_modules.store(true, std::memory_order_release);
+        for (;;) {
+            if (rescan_package_modules.exchange(false, std::memory_order_acq_rel))
+                patch_package_modules();
+            Sleep(25);
+        }
+    }, nullptr, 0, nullptr)) {
+        CloseHandle(worker);
+    } else {
+        x2w_local::logf("x2w-runtime proxy: package-module worker unavailable (%lu)", GetLastError());
+    }
 }
 
 // ---- the local user -------------------------------------------------------------------------
@@ -617,9 +858,10 @@ constexpr char submit_identity[] = "local XGameSaveSubmitUpdate";
 HRESULT WINAPI submit_provider(unsigned, const void*) { return S_OK; }
 u64 async_submit(int slot, u64 update, u64 block)
 {
-    if (!block || !real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!block || !ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query)) return static_cast<unsigned>(query);
     if (!service) return e_fail;
     auto** methods = *static_cast<void***>(service);
@@ -647,9 +889,10 @@ u64 async_submit(int slot, u64 update, u64 block)
 constexpr char user_add_identity[] = "local XUserAddAsync";
 u64 local_user_add(u64 block)
 {
-    if (!block || !real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!block || !ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query) || !service) {
         x2w_local::logf("x2w-runtime local: XUserAddAsync, async service unavailable 0x%08lx", static_cast<unsigned long>(query));
         return FAILED(query) ? static_cast<unsigned>(query) : e_fail;
@@ -775,9 +1018,10 @@ u64 snapshot_read(ReadAsync& state, u64 container, u64 names_pointer, std::uint3
 }
 u64 async_read(int slot, u64 container, u64 names, u64 count_or_size, u64 block_or_buffer, u64 count_pointer)
 {
-    if (!real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query)) return static_cast<unsigned>(query);
     if (!service) return e_fail;
     auto** methods = *static_cast<void***>(service);
@@ -1227,15 +1471,21 @@ void* storage_object()
 
 int x2w_store_method3_check() { return store_method3_check(); }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, void*)
 {
     if (reason == DLL_PROCESS_ATTACH && x2w_local::env_on("X2W_RUNTIME_PROXY")) {
+        // Published IAT entries, the loader callback and both workers reference this module.
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                reinterpret_cast<LPCWSTR>(self), &pinned))
+            return FALSE;
+        proxy_module = self;
         fill_slots(std::make_index_sequence<max_slots>{});
         patch_imports();
         // Heartbeat: every 10 s, the runtime methods called since the last report and how often, so
         // a title that keeps polling one call (waiting for something) shows it after the first-call
         // logs have gone quiet.
-        CreateThread(nullptr, 0, [](void*) -> DWORD {
+        if (HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
             static LONG seen[max_providers][max_slots];
             for (int second = 10;; second += 10) {
                 Sleep(10000);
@@ -1253,7 +1503,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
                     }
                 if (any) x2w_local::logf("%s", line);
             }
-        }, nullptr, 0, nullptr);
+        }, nullptr, 0, nullptr)) CloseHandle(heartbeat);
     }
     return TRUE;
 }

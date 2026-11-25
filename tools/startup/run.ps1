@@ -47,6 +47,9 @@ if (Test-Path $config) {
 if ($StoragePath) { $env:X2W_STORAGE_PATH = $StoragePath }
 if ($InputScript) { $env:X2W_INPUT_SCRIPT = $InputScript }
 if ($FakeUser) { $env:X2W_FAKE_USER = "1" }
+if (-not $FakeUser -and $env:X2W_FAKE_USER -ne "1") {
+    Write-Warning "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
+}
 if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }

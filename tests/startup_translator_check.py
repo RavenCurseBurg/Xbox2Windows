@@ -98,6 +98,9 @@ class StubPipeline:
     def manifest(self):
         return 'manifest\n'
 
+    def ps_profile(self):
+        return 'ps_5_1'
+
 
 @contextlib.contextmanager
 def fxc_environment(work, configured, kits, path=''):

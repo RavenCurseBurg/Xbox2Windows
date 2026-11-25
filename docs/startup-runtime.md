@@ -63,6 +63,25 @@ error, and it leaves one query open at Close. `startup_list_queries_default_{war
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
 `command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
 
+## Depth target on translated draws
+
+List slot 50 (`OMSetRenderTargets`) passes a bound depth-stencil view to the desktop list in the same call
+as the colour targets, and the translated pipeline takes its `DSVFormat` from that view. A depth handle that
+holds 0 maps to no descriptor: the colour targets are bound without depth, and the stand-in logs it and
+counts it in `x2w_d3d12_render_target_stats`. A depth handle in no descriptor heap, or one that is not a
+depth-stencil view, refuses the whole bind (also logged and counted), so nothing is drawn onto targets the
+title did not ask for. `ctest --preset release --no-tests=error -R "^startup_draw_depth_target_" -V` draws a
+near and a far triangle with a depth-tested stream pipeline and reads back the colour and the D32 depth
+values after the fence. With the view bound, the near triangle wins and depth is 0.25 where drawn. The
+`_debug` test also requires no debug-layer message after the fence, and reports a skip (77) when the
+debug layer is not installed. With a zero handle, the far triangle overwrites and depth keeps its clear
+value. With an unknown handle, nothing is drawn. Each unresolved handle is counted once. The `_drop_control`
+draws the bound case with a zero handle and passes only when the intended colour and depth mismatch appears.
+
+Mesh pipelines reach the stand-in only as native desktop-bytecode streams, which must have a pixel stage
+and no depth format. A depth-only mesh pass (no colour target, no pixel stage) is therefore refused when
+the pipeline is created, and no fixture binds a depth target for one.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
@@ -475,7 +494,13 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). Offline mode
+applies to the title's process only. Runtime calls can still be serviced by Gaming Services
+components outside that process, which can use a signed-in Xbox, Store or Gaming Services account.
+Prefer a Windows user or machine with none of those accounts signed in, or the isolated VM in
+[Iterating on start-up runs](#iterating-on-start-up-runs). The live log window already notes that it
+does not establish that all network activity is blocked; see
+[Startup memory accounting](#startup-memory-accounting).
 
 The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
 (`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
@@ -553,6 +578,94 @@ print the same results and write the same failures as one, an unexpected transla
 `<key>.fail`, and an invalid `X2W_TRANSLATE_JOBS` falls back to the processor count.
 `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
 with a child process.
+
+### Compute pipeline requests
+
+Device slot 67 creates a pipeline from a console compute program. The stand-in reads 12 64-bit words of the
+description:
+
+| Words | Content |
+|---|---|
+| 0 | root signature |
+| 1-2, 3-4 | two state blocks and their sizes (a size of 0 means the block is absent) |
+| 5-6 | program code and its size |
+| 7-8 | a second blob and its size |
+| 9, 10 | pointers whose targets are not decoded |
+| 11 | a value |
+
+It interprets none of these parts and still creates a placeholder. With `X2W_D3D12_RENDER=1` and
+`X2W_SHADER_CACHE` set, it writes a request to the cache directory the graphics requests use:
+
+| File | Content |
+|---|---|
+| `req_<key>.desc` | the 12 words with the pointer words 0, 1, 3, 5, 7, 9 and 10 always set to zero, so no process address reaches a file or the key |
+| `req_<key>.sa`, `req_<key>.sb` | state blocks A and B (at most 4 KiB each; empty when the size is 0) |
+| `req_<key>.data` | the words 7-8 blob (at most 1 MiB; required) |
+| `req_<key>.root` | the serialized root signature |
+| `req_<key>.c67` | the program code (at most 1 MiB); written last, as the ready marker |
+
+The `.c67` extension keeps these requests apart from draft #1954, which uses `req_<key>.cs` for desktop DXIL
+containers created at device slot 62.
+
+**Reading the parts.** Each part is checked and then copied once, with a fault-safe copy, before anything is
+hashed, scanned or written, so a later write by the title cannot leave a file that does not match its key.
+If any declared part cannot be taken, no file is written and the creation counts as failed. The logged reason
+names the part and the cause:
+- a code or data size of 0 (a program without the words 7-8 blob is refused);
+- a size over its limit;
+- a part that is not readable to its declared end;
+- a description that is not readable;
+- a root signature without a recorded blob.
+
+A cache directory that is set but does not exist makes every creation fail. Publishing is off only when
+render mode is off or `X2W_SHADER_CACHE` is unset; such creations are counted nowhere.
+
+**Key.** The key hashes the revision string followed by `cs`, then each part preceded by its length as a
+little-endian u64. The order is: code, words 7-8 blob, root, `.desc`, `.sa`, `.sb` (`compute_key` in
+`gfx2hlsl.py`), so moving bytes from one part to the next changes the key. A compute key and a graphics key
+can still coincide only through a 64-bit hash collision, or through a graphics program crafted to start with
+the compute framing.
+
+What words 9 and 10 point to is not part of the request, so two descriptions that differ only there share a
+key. If those targets are decoded and added later, every key changes and each request is published once more.
+
+**Pointers inside blobs.** An aligned qword in `.data`, `.sa` or `.sb` that names committed memory of the
+process (one `VirtualQuery` per candidate, so no fault is taken) would make its key run-dependent. These
+qwords are counted and published, not refused, because hash-like values can name memory by chance. The code
+is not scanned.
+
+**Dedupe.** Each key is written once per cache and never rewritten. Parts left by an interrupted write, which
+has no `.c67` yet, are kept, and the next creation completes the request. A key already seen in the process
+costs no file access, and the writes take their own lock, not the draw lock.
+
+**Log and totals.** Each creation logs `x2w-draw compute request <key> published`, `already present` or
+`not written`, with the reason when refused, up to 12 lines per run. The render totals line ends with
+`compute requests published <n> (already present <n>, failed <n>, pointer-like blob qwords <n>)`.
+
+**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker. With no compute stage yet,
+they record `compute stage not supported` in `<key>.fail`. The request stays in the cache, and a later
+`--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics counts
+do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
+
+**Local observation** (a local build of this change ported to an older base; one title, local files only, not
+in the repository):
+- One run published 2,689 requests with 0 failed. It wrote 2,689 files of each of the six kinds, 120.3 MB in
+  all (98.8 MB of it `.c67`), and counted 729 pointer-like blob qwords.
+- A second run with the same cache published 0 (2,689 already present, 0 failed), wrote no files and changed
+  no modification time.
+- An earlier build with the same layout found that in every request the code length equals word 6 and the
+  blob length equals word 8, and that state block A is 28 bytes and state block B 20 bytes.
+- In the first 40 descriptions, words 9 and 10 point at a readable block of at least 4 KiB.
+
+**Checks.** Run `ctest --preset dev --no-tests=error -R "^startup_compute_request_(warp|disabled_control)$" -V`
+after building `startup_stream_consumer`. On WARP:
+- The same synthetic description is created twice in each of two processes, with words 9 and 10 pointing
+  into the consumer and a 20-byte state block B, and the files are written once.
+- Each refusal writes no file. These include reads next to a `PAGE_NOACCESS` page and sizes 1 byte over each
+  limit, while code, data and both state blocks at exactly their limits are published.
+- A valid, refused, valid sequence publishes the two valid keys.
+- A request whose first four parts already exist is completed without rewriting them.
+- The control runs without render mode and must print `FAIL: no compute request`.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
@@ -649,6 +762,14 @@ x2w-render totals: ... translated draws N (not drawn M), pipelines translated P 
 ```
 
 Compare the last line of each run. More translated draws and fewer "not drawn" mean a translator change reached real draws. "missing" is a live count of pipelines still waiting for a manifest. It can grow while things improve, if the run gets further and requests new pipelines.
+
+Beside the totals line, one line counts every `ExecuteIndirect` call (command-list slot 61) since the start, forwarded or by refusal reason, then by signature kind (`draw`, `drawindexed`, `dispatch`, `dispatchmesh`, or `other` for a placeholder or unknown signature); a reason with no calls reads `0`:
+
+```
+x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; other: drawindexed 3
+```
+
+`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
 
 ### 4. Census, then rank
 
@@ -775,6 +896,8 @@ cmake --build --preset release --target startup_inflate_probe
 
 A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.
 
+Failed requests report distinct status HRESULTs where the cause is known (#1843). A destination smaller than the data (`destination capacity exceeded`) reports `0x8007007A` (`ERROR_INSUFFICIENT_BUFFER`); a file read at or past the end, or crossing it, reports `0x80070026` (`ERROR_HANDLE_EOF`); every other cause stays `E_FAIL`. The same code is the `HRESULT` of the first-failure record. `OpenFile` with a null path returns `E_INVALIDARG`, `CreateQueue` with a null descriptor returns `E_INVALIDARG`, and a null output pointer returns `E_POINTER`; the output is set to null on every refusal. `tests/startup_dstorage_destination_check.cpp` pins each code on the real stand-in.
+
 `tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
 
 ```powershell
@@ -837,14 +960,15 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
+| `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
-| `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
+| `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
@@ -854,6 +978,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 | `X2W_STOP_AT=<rva>[,...]` | the startup debugger stops at a main-image breakpoint at one of these addresses even while `-ContinueAsserts` steps over the others, and writes every thread's stack to `threads_stop.txt` |
+| `X2W_LOG_AT=<rva>[@<max hits>][:<item>[;<item>...]][,...]` | logs the elapsed time, thread ID, main-image instruction RVA, hit number and selected values to `files.txt`. RVAs and offsets are hexadecimal. The hit limit is decimal and defaults to 16 per RVA. Items are `rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`, `rsi`, `rdi`, `r8` through `r15`, or `[reg+hex]` / `[reg-hex]` for a qword read (`unreadable` on failure). Omit the item list to log all 16 registers. At the limit the debugger restores the original instruction unless another hook shares the breakpoint. INT3 events that other threads raised before the restore are resumed at the restored instruction, not logged, and counted on a separate `LOG_AT late hits resumed after the limit` summary line. Malformed entries (including a repeated item, compared by register and offset) and unusable breakpoints are reported in `events.txt`. The end summary lists logged hits per RVA. Fixture: `ctest --preset dev --no-tests=error -R '^startup_debug' -V`. |
 | `X2W_DUMP_AT=<seconds>[,...]` | the startup debugger writes every thread's stack to `threads_<seconds>.txt` at those times, for a run that stalls before a watchdog or the timeout ends it |
 | `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any, unreadable for an incomplete read), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
@@ -1152,6 +1277,14 @@ Slot 21 reserves the caller's async block on that same XAsync service, with its 
 
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable. `ctest --preset dev --no-tests=error -R '^startup_save_blob_pack'` checks `src/startup_stubs/save_blob_pack.h` directly without a runtime or disk store, including layout, `uint32_t` payload-size and `size_t` overflow refusals, and a negative control for the earlier size check.
 
+### Completion on a manual queue
+
+A completed XAsync operation can sit unconsumed when its block names a queue whose completion port is manual and nobody dispatches that port. `tests/startup_async_manual_completion.cpp` separates this from an operation that is still pending. It starts one synthetic operation on a queue whose work and completion ports are both manual. The provider completes it with an 8-byte payload on another thread. The test then prints four observations for each phase: the Begin return, the non-waiting `XAsyncGetStatus`, `XAsyncGetResultSize` and the callback count with what the callback retrieved. The phases are before completion (`pending`), after the provider thread completes the block, with no work-port callback and no completion-port dispatch (`unpumped`), and after one completion-port dispatch (`dispatched`). The callback count must be 0 until the completion port is dispatched. One dispatch must then run exactly one callback that retrieves the payload, and a second dispatch must find no work. A second block on an immediate queue is the contrast: its callback runs at completion with no dispatch. The `system` variant uses the installed Windows gaming runtime's XAsync service (`073b7dcb`) and prints its status and result-size answers. It accepts `E_PENDING` or `S_OK` before completion-port dispatch and requires `S_OK` after it. It reports a capability skip (77) when the runtime or its XAsync service is unavailable. Queue creation errors after obtaining the service fail the test. One measurement used Gaming Services 39.118.30001.0 (`xgameruntime.dll` 10.0.26100.9656) on Windows 10 build 19045. Before completion, both answers were `E_PENDING` (`0x8000000a`). Once the operation was complete but undispatched, the status was `S_OK`, the result size was 8 bytes and no callback had run. After the dispatched callback retrieved the result, the status stayed `S_OK` and the result size was 0. So a non-waiting status call separates an operation that is still pending from one whose completion has not been dispatched. The `controlled` variant uses a stand-in service in the test. In `inline_control` that stand-in runs the callback inside `XAsyncComplete`, as an immediate port would, and the control must print `FAIL: callback ran before the completion port was dispatched`. [XAsyncGetStatus](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus) · [XTaskQueueDispatch](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch)
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_async_manual_completion_(controlled|system|inline_control)$' -V
+```
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.
@@ -1194,6 +1327,26 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
+- **DPP quad pair broadcasts.** The four pair permutations of a pixel stage (`quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]`, `[0,1,0,1]`, with
+  `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
+  first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
+  same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
+  draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
+  with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
+- **DPP quad broadcasts.** `quad_perm:[k,k,k,k]` for k = 0, 1, 2 or 3, with full `row_mask` and
+  `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
+  integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
+  quad are one 2 x 2 pixel block (lane = x & 1 | (y & 1) << 1). The lowering applies to straight-line pixel
+  stages that ran `s_wqm exec, exec` with EXEC unchanged since, so no lane of the quad is off; without that proof the broadcast is refused. `QuadReadLaneAt` is shader model
+  6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
+  Kits `bin` folder or on `PATH`), and its vertex stage as `vs_6_0` too, because D3D12 rejects a pipeline
+  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. For single-lane broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
+  refused. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast"`: the controls
+  check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
+  fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -1552,7 +1705,8 @@ These are measured on one executable; treat them as hypotheses for others.
   reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
   in its colour form, is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
-- Depth-stencil registers are decoded but not applied yet (#1999, item A). State block A of a
+- Depth-stencil registers are decoded, and applied only with `X2W_DEPTH_STATE=1` (#1999, item A;
+  see the next bullet). State block A of a
   slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
   `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
   covered. `src/startup_stubs/pipeline_state_decode.h`
@@ -1564,6 +1718,37 @@ These are measured on one executable; treat them as hypotheses for others.
   each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
   Its `_offset_control` run (words one word later) is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
+- `X2W_DEPTH_STATE=1` (off by default) takes that decoded state for translated draws of slot 57
+  pipelines (`src/startup_stubs/depth_state_apply.h`, applied in `translation_for` in
+  `d3d12_draw.inl`). A slot 57 pipeline has no desktop `DEPTH_STENCIL` subobject, so there is no
+  desktop state to outrank; a state found first is kept regardless. When the decoder refuses the
+  words, or the block is too short, the pipeline keeps the desktop default (depth and stencil off)
+  and one line says why (`depth-stencil registers not used (...)`). The decoded state needs a depth
+  view: a draw with none bound keeps the desktop default. The stencil reference is list state in
+  D3D12, so each draw of such a pipeline with an enabled stencil test calls `OMSetStencilRef` with
+  the decoded value for that draw and restores the guest's list reference immediately after it.
+  A successful list reset restores the default reference of zero. The mixed-pipeline test sets a
+  distinct guest reference before the slot 57 draw, then checks a desktop-state stencil draw on
+  the same list without another reference call. The pipeline key includes the
+  decoded description. With the switch off nothing reads the words: no description, key or
+  reference changes, and no log line appears. That is checked device-free
+  (`startup_depth_state`, with `startup_depth_state_switch_control` as the negative control) and by
+  the draw fixture's switch-off run, and the existing `startup_stream_depth_*` and
+  `startup_slot57_blend_draw_*` tests, which run without the switch, still pass.
+  `tests/startup_slot57_depth.cpp` and `tests/startup_slot57_depth_check.py` draw two overlapping
+  triangles of unequal depth (z 0.25 and 0.75, same synthetic shaders and vertex program) into an
+  8x4 target with a D24S8 view, with the same renderer on WARP and on a hardware adapter. With
+  reversed-Z words (GREATER, depth cleared to 0) the nearer triangle wins (red); with the switch off
+  the last-drawn triangle wins (green); with LESS, the wrong direction for that clear, nothing
+  passes (blue); a forward-Z LESS case reverses the draw order and shows green with the switch on,
+  red with it off. Stencil is checked separately: EQUAL against a stored 0x5A passes with reference
+  0x5A and fails with 0x5B (the list's own reference is 0, so only the decoded one explains it), and
+  REPLACE 7 followed by EQUAL 7 or EQUAL 8 leaves green or red. Words with a colour-write tie or a
+  stencil `ONES` op fall back to the desktop result. Measured on WARP (10.0.26100.9818) and an
+  NVIDIA GeForce RTX 3080 (driver 32.0.16.2124), Windows 11 10.0.26200
+  (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
+  raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
+  (#1806), and any pipeline layout other than the measured one.
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -1908,8 +2093,9 @@ memory-type and state rules are unchanged. The five-second `x2w-d3d12 views note
   between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
   64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
   the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
-  without the committed-bytes check and must fail only in the partly committed cases;
-  `_walk_only_control` never uses the region information and must fail only that call count. A
+  without the committed-bytes check and passes only when its decisions differ in the partly committed
+  cases and nowhere else; `_walk_only_control` never uses the region information and passes only when
+  that call count is its sole failure. Neither is `WILL_FAIL`, so a crash cannot pass them. A
   refused allocation or mapping is a capability skip (77) in the controls.
 
 ## Buffer memory SRVs (device slot 70)

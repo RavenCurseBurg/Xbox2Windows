@@ -3069,6 +3069,85 @@ class TrackedScalar(dict):
         super().__setitem__(key, value)
 
 
+S_CALL = re.compile(r"s_call_b64 (s\[\d+:\d+\]), (-?0x[0-9a-f]+|-?\d+)")
+S_BRANCH = re.compile(r"s_(?:branch|cbranch_\w+) (-?0x[0-9a-f]+|-?\d+)")
+S_CALL_CONTROL = ("s_branch", "s_cbranch", "s_call", "s_swappc", "s_getpc", "s_subvector", "s_rfe")
+
+
+def names_sgpr(line, pair):
+    """True when line names an SGPR of pair (as a number list) alone or inside a range."""
+    for m in re.finditer(r"\bs(\d+)\b|\bs\[(\d+):(\d+)\]", line):
+        low, high = (int(m[1]),) * 2 if m[1] is not None else (int(m[2]), int(m[3]))
+        if low <= pair[-1] and pair[0] <= high:
+            return True
+    return False
+
+
+def inline_calls(instructions):
+    """Inline the one forward s_call_b64 of a program (proposal R0Y00/Xbox2Windows#1786, first slice).
+
+    The callee is a straight-line block behind the program's s_endpgm that ends in the last instruction, an
+    s_setpc_b64 of the saved pair. The call stays as a marker and the callee body, without the s_setpc_b64, follows it
+    with offsets that keep the sizes of the instructions, so everything after the call moves by the body size. A branch
+    that crosses the call or lands in the callee is refused, since its displacement would change. A program without
+    s_call_b64 is returned as it is."""
+    texts = [e[1] if isinstance(e, tuple) and len(e) == 2 else e for e in instructions]
+    calls = [k for k, text in enumerate(texts) if isinstance(text, str) and text.split(None, 1)[:1] == ["s_call_b64"]]
+    if not calls:
+        return instructions
+    if (not all(isinstance(e, tuple) and len(e) == 2 and type(e[0]) is int and isinstance(e[1], str)
+                for e in instructions)
+            or any(b[0] <= a[0] or a[0] % 4 for a, b in zip(instructions, instructions[1:]))):
+        raise ValueError("s_call_b64 requires strictly increasing instruction offsets")
+    c, count = calls[0], len(instructions)
+    call_offset = instructions[c][0]
+    if not (m := S_CALL.fullmatch(texts[c])):
+        raise ValueError(f"Unsupported s_call_b64 form: {texts[c]}")
+    pair = sgpr_pair(m[1])
+    imm = int(m[2], 0)
+    if not -0x8000 <= imm <= 0x7fff:
+        raise ValueError("s_call_b64 displacement out of range")
+    target = call_offset + 4 + 4 * imm
+    if target <= call_offset:
+        raise ValueError("Backward or recursive s_call_b64")
+    start = next((k for k, e in enumerate(instructions) if e[0] == target), None)
+    if start is None:
+        raise ValueError("s_call_b64 targets no instruction boundary of the program")
+    if texts[start - 1] != "s_endpgm":
+        raise ValueError("The s_call_b64 callee must follow the program's s_endpgm")
+    for k in range(start, count):
+        op = texts[k].split()[0]
+        if op == "s_setpc_b64":
+            if texts[k] != f"s_setpc_b64 s[{pair[0][1:]}:{pair[1][1:]}]":
+                raise ValueError(f"Unsupported indirect s_setpc_b64: {texts[k]}")
+            end = k
+            break
+        if op == "s_endpgm":
+            raise ValueError("The s_call_b64 callee reaches s_endpgm without s_setpc_b64")
+        if op.startswith(S_CALL_CONTROL):
+            raise ValueError(f"The s_call_b64 callee is not straight-line: {texts[k]}")
+    else:
+        raise ValueError("The s_call_b64 callee has no s_setpc_b64")
+    if end != count - 1:
+        raise ValueError("Code follows the s_call_b64 callee")
+    if len(calls) != 1:
+        raise ValueError("Only one s_call_b64 per program is supported")
+    for k in range(start - 1):
+        if texts[k].startswith(("s_branch", "s_cbranch")):
+            offset = instructions[k][0]
+            if not (b := S_BRANCH.fullmatch(texts[k])):
+                raise ValueError(f"Unsupported branch next to s_call_b64: {texts[k]}")
+            landing = offset + 4 + 4 * int(b[1], 0)
+            if landing >= target:
+                raise ValueError("Branch into the s_call_b64 callee")
+            if (offset < call_offset < landing) or (landing <= call_offset < offset):
+                raise ValueError("Branch across s_call_b64")
+    size = instructions[end][0] - target
+    return tuple([*instructions[:c + 1],
+                  *((call_offset + 4 + offset - target, text) for offset, text in instructions[start:end]),
+                  *((offset + size, text) for offset, text in instructions[c + 1:start])])
+
+
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None,
@@ -3232,10 +3311,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     free_coordinates = False  # a sample took a coordinate that is not attr0.x/y
     interpolated = False
     region = None
+    call_pair = None  # SGPR numbers of the opaque s_call_b64 return address, once the call was lowered
     seen_skip = False
     has_scratch = False
     scratch_written = set()
-    instructions = tuple(instructions)
+    instructions = inline_calls(tuple(instructions))
     if any(isinstance(element, tuple) for element in instructions):
         offset_index = {}
         previous_offset = -1
@@ -3333,6 +3413,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         def match(pattern):
             return re.fullmatch(pattern, line)
 
+        if call_pair is not None and names_sgpr(line, call_pair):
+            raise ValueError(f"The s_call_b64 return address is opaque: {line}")
         if ended:
             raise ValueError("Instruction follows program end")
         if ds_needs_wait:
@@ -3778,6 +3860,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
+        elif m := S_CALL.fullmatch(line):
+            # The inlined call (inline_calls): the pair receives the address after the call, an opaque value that
+            # only the removed s_setpc_b64 consumed. Neither the callee nor the code after it may name either word.
+            lo, hi = sgpr_pair(m[1])
+            if lo in pending or hi in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[lo] = scalar[hi] = ("call_return",)
+            call_pair = [int(lo[1:]), int(hi[1:])]
         elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
             # A forward branch on a tracked scalar compare (issue #1413). SCC is a wave value, so the whole wave
             # skips the block or runs it. The block's vector writes merge with a select on the condition under

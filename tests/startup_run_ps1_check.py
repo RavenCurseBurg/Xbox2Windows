@@ -56,6 +56,16 @@ STOP = "taskkill.exe /T /F /PID $translator.Id"
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
+# Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
+FAKE_USER_WARN = re.compile(
+    r"if\s*\(\s*-not\s+\$FakeUser\s+-and\s+\$env:X2W_FAKE_USER\s+-ne\s+\"1\"\s*\)\s*\{\s*"
+    r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
+    re.I | re.S,
+)
+FAKE_USER_WARNING = (
+    "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
+)
+FAKE_USER_WARN_LINE = f'Write-Warning "{FAKE_USER_WARNING}"'
 
 
 def decode(raw):
@@ -70,7 +80,7 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
-def run_case(shell, script, code, work, translate=False, switches=(), passed=()):
+def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -90,6 +100,9 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     exe.write_bytes(b"")
     data.mkdir()
     env = dict(os.environ)
+    env.pop("X2W_FAKE_USER", None)
+    if fake_user_env:
+        env["X2W_FAKE_USER"] = "1"
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
@@ -108,9 +121,12 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     printed = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    if printed != STUB_LINES[:HEAD_LINES]:
-        found.append(f"stub exit {code}: printed {printed} instead of the first {HEAD_LINES} "
-                     f"debugger lines (stderr: {out.stderr.strip()!r})")
+    want_output = STUB_LINES[:HEAD_LINES]
+    if not fake_user_env and "-FakeUser" not in switches:
+        want_output = [f"WARNING: {FAKE_USER_WARNING}", *want_output]
+    if printed != want_output:
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
+                     f"(stderr: {out.stderr.strip()!r})")
     summary = Path(str(log) + ".out")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
@@ -143,6 +159,10 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, code, work)
         if found and first_only:
             return found
+    found += run_case(shell, script, 0, work, switches=["-FakeUser"])
+    found += run_case(shell, script, 0, work, fake_user_env=True)
+    if found and first_only:
+        return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
     if found and first_only:
@@ -175,6 +195,8 @@ def text_problems(script):
         found.append(f"the script does not end with 'exit ${capture.group(1)}'")
     if HEAD not in after[1:-1]:
         found.append("the log head is not printed between the capture and the exit")
+    if not FAKE_USER_WARN.search(code):
+        found.append("missing Write-Warning when -FakeUser is not passed")
     return found
 
 
@@ -188,10 +210,12 @@ def mutants_of(script):
             early += [other for other in lines if is_exit(other)]
         if not is_exit(line):
             early.append(line)
+    no_fake_warn = [line for line in lines if FAKE_USER_WARN_LINE not in line]
     mutants = {
         "no capture and no exit": [line for line in lines if not is_exit(line) and not is_capture(line)],
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
+        "no FakeUser warning": no_fake_warn,
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 
@@ -223,7 +247,8 @@ def main():
             if bad:
                 continue
             mutants = mutants_of(script)
-            if shells:  # only an executed run can see the translator outlive the script
+            if shells:
+                # only an executed run can see the translator outlive the script
                 stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
                 mutants["translator left running"] = None if stopless == script else stopless
                 parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")

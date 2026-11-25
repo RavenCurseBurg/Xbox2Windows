@@ -20,6 +20,8 @@
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
+#include "startup_stubs/depth_state_apply.h"
+#include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
@@ -164,6 +166,7 @@ constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
+void request_translation(Wrapper* pipeline);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -1070,7 +1073,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
 void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
-void reset_viewport_state(Wrapper* self);
+void reset_list_dynamic_state(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1348,7 +1351,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
-        reset_viewport_state(self);
+        reset_list_dynamic_state(self);
         discard_draw_sampler_heaps(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
     }
@@ -1874,6 +1877,7 @@ struct Pass {
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
+    Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
     u64 source_view_heap = 0;
@@ -1884,6 +1888,7 @@ struct Pass {
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -1949,10 +1954,11 @@ void release_targets(Wrapper* self)
     pass = Pass{};
 }
 
-// A reset list starts without a viewport or scissor, whatever the previous recording set.
-void reset_viewport_state(Wrapper* self)
+// A reset list has no viewport or scissor and uses the default stencil reference.
+void reset_list_dynamic_state(Wrapper* self)
 {
     if (!self->own().pass) return;
+    pass_of(self).stencil_reference = 0;
     pass_of(self).viewport_set = false;
     pass_of(self).scissor_set = false;
     pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
@@ -2112,11 +2118,21 @@ HRESULT __stdcall device_create_query_heap(Wrapper* self, const D3D12_QUERY_HEAP
     return hr;
 }
 
+// Slot-61 calls by outcome and signature kind (IndirectCommand; none counts placeholder and unknown
+// signatures), reported with the render totals. 64-bit and never reset, so they neither wrap nor stall.
+enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline, indirect_placeholder, indirect_other,
+       indirect_outcomes };
+volatile LONG64 indirect_calls[indirect_outcomes][5];
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
-    const auto refuse = [](const char* reason) {
+    // Every refusal is counted under the signature's kind, including those before the signature is checked.
+    Wrapper* sig = as_wrapper(signature);
+    IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
+    const auto refuse = [&kind](const char* reason, int outcome = indirect_other) {
+        InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         static LONG refusals;
         if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
@@ -2125,10 +2141,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
-    if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
-    Wrapper* sig = as_wrapper(signature);
+    // Only a desktop Dispatch signature runs more than one command or reads a count buffer here.
+    constexpr UINT max_dispatch_commands = 1u << 16;
+    if (!count || count > max_dispatch_commands) return refuse("command count is zero or above the supported maximum");
+    if (!count_buffer && count_offset) return refuse("count offset without a count buffer");
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
-        return refuse("missing or placeholder signature");
+        return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device");
@@ -2138,13 +2156,22 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     u64 bytes = sig->own().indirect_bytes;
+    if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh)
-            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
+            // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
+            // nothing is drawn.
+            if (pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
+                pass.requested_pipeline = pass.pipeline;
+                request_translation(pass.pipeline);
+            }
+            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
+                          indirect_graphics_pipeline);
+        }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             pass.target_formats[0] != pass.indirect_graphics.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
@@ -2155,9 +2182,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (samples.Count != 1 || samples.Quality)
             return refuse("draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
-        return refuse("requires a desktop compute pipeline and root");
+        return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root");
+    } else if (sig->own().signature_root && (count != 1 || count_buffer)) {
+        // Batched and count-buffer Dispatch is supported for rootless signatures only in this slice.
+        return refuse("a Dispatch signature with root constants requires one command and no count buffer");
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
@@ -2165,7 +2195,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
     if (!base || (offset & 3) || offset > ~u64{} - base)
         return refuse("invalid argument offset or unmapped buffer");
-    const auto found = placed_buffer_range(device, base + offset, bytes);
+    // Every record up to the maximum must lie in the buffer: the count word can only lower the number executed.
+    const u64 span = u64{count - 1} * sig->own().indirect_bytes + bytes;
+    if (span < bytes || base + offset > ~u64{} - span) return refuse("argument records overflow the address space");
+    const auto found = placed_buffer_range(device, base + offset, span);
     if (found.reject || found.owner != buffer) return refuse("argument record is outside a unique placed buffer");
     const auto* info = resource_info(buffer);
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
@@ -2199,8 +2232,28 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
     }
+    ID3D12Resource* counts = nullptr;
+    if (count_buffer) {
+        // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
+        Wrapper* count_wrapper = as_wrapper(count_buffer);
+        if (!count_wrapper || count_wrapper->own().kind != resource_kind || !count_wrapper->own().real)
+            return refuse("count buffer has no desktop resource");
+        const auto count_base = reinterpret_cast<u64>(count_wrapper->own().title_memory);
+        if (!count_base || (count_offset & 3) || count_offset > ~u64{} - count_base - sizeof(UINT))
+            return refuse("invalid count offset or unmapped count buffer");
+        const auto count_found = placed_buffer_range(device, count_base + count_offset, sizeof(UINT));
+        if (count_found.reject || count_found.owner != count_wrapper)
+            return refuse("count word is outside a unique placed buffer");
+        const auto* count_info = resource_info(count_wrapper);
+        if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+            return refuse("count buffer does not use COMMON state tracking");
+        counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
+        if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
     require_state(self, resource, argument_state);
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
+    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
+                          counts ? count_offset : 0);
+    InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
 // draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
@@ -2450,7 +2503,10 @@ void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 // List slot 24, OMSetStencilRef(reference): list state that the stencil test of the next draws compares against.
 void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
-    if (auto* list = recording(self)) list->OMSetStencilRef(reference);
+    if (auto* list = recording(self)) {
+        pass_of(self).stencil_reference = reference;
+        list->OMSetStencilRef(reference);
+    }
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
@@ -3453,7 +3509,8 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
 }
 
 // Device slots 57 and 67 (Xbox order): (desc*, riid, ppv) with the ID3D12PipelineState IID; pipeline
-// descriptions whose layout is not decoded yet. The result is a placeholder PipelineState.
+// descriptions whose layout is not decoded yet. The result is a placeholder PipelineState. In render
+// mode a slot 67 (compute) description also publishes a translation request (d3d12_draw.inl).
 template <int N>
 HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc, const GUID* iid, void** out)
 {
@@ -3470,6 +3527,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         log("x2w-d3d12 Device::slot%d(pipeline?) desc=[%s] riid=%s -> placeholder", N, bytes, text);
     }
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    if constexpr (N == 67) publish_compute_request(desc);
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
     return S_OK;
@@ -3767,7 +3825,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
@@ -3775,7 +3833,25 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)]);
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
+            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
+        static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
+                                               "placeholder-signature", "other"};
+        static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
+        char line[1024];  // fits every outcome with five 19-digit counts
+        int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
+        for (int o = 0; o < indirect_outcomes; ++o) {
+            n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);
+            const int start = n;
+            for (int k = 0; k < 5; ++k)
+                if (const LONG64 calls = indirect_calls[o][k])
+                    n += std::snprintf(line + n, sizeof(line) - n, " %s %lld", kinds[k], static_cast<long long>(calls));
+            if (n == start) n += std::snprintf(line + n, sizeof(line) - n, " 0");
+        }
+        log("%s", line);
+    }
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];

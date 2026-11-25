@@ -280,7 +280,7 @@ bool dstorage_error_record_checks()
     failing.enqueue(first);
     failing.enqueue(next);
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "event signaled before Submit")) return false;
-    if (!check(failing.submit() == E_FAIL && first_dest == sentinel && next_dest == sentinel,
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && first_dest == sentinel && next_dest == sentinel,
                "out-of-range requests failed and preserved their destinations")) return false;
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0 &&
                WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "failed request did not leave the error event signaled"))
@@ -317,7 +317,7 @@ bool dstorage_error_record_checks()
                "expected two failures and an intact guard") ||
         !check(rec::read<std::int32_t>(record, rec::command_type) == rec::command_request,
                "first failure's CommandType is not DSTORAGE_COMMAND_TYPE_REQUEST") ||
-        !check(rec::read<HRESULT>(record, rec::hresult) == E_FAIL && rec::read<u64>(record, rec::options) == first.options &&
+        !check(rec::read<HRESULT>(record, rec::hresult) == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && rec::read<u64>(record, rec::options) == first.options &&
                rec::read<void*>(record, rec::destination) == first.destination &&
                rec::read<std::uint32_t>(record, rec::destination_size) == first.destination_size &&
                rec::read<u64>(record, rec::file_offset) == first.file_offset &&
@@ -340,12 +340,12 @@ bool dstorage_error_record_checks()
     static_assert(sizeof long_name - 1 == 70);
     const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, long_name};
     failing.enqueue(too_small);
-    if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && memory == sentinel, "short memory destination was not refused") ||
         !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
     const unsigned char* memory_failure = retrieve(failing);
     return check(rec::read<std::uint32_t>(memory_failure, rec::failure_count) == 1 &&
                  rec::read<std::int32_t>(memory_failure, rec::command_type) == rec::command_request &&
-                 rec::read<HRESULT>(memory_failure, rec::hresult) == E_FAIL &&
+                 rec::read<HRESULT>(memory_failure, rec::hresult) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
                  rec::read<u64>(memory_failure, rec::options) == too_small.options &&
                  rec::read<void*>(memory_failure, rec::destination) == too_small.destination &&
                  rec::read<std::uint32_t>(memory_failure, rec::destination_size) == too_small.destination_size &&
@@ -740,7 +740,7 @@ bool dstorage_checks() {
         bool bounds_ok = true;
         for (unsigned i = 0; i < 3; ++i) {
             const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            bounds_ok &= hr == (i == 1 ? HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) : S_OK);
             for (unsigned j = 0; j < 6; ++j)
                 bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
         }
@@ -1836,7 +1836,8 @@ bool dstorage_directory_batches()
     const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
     for (unsigned i = 0; i < 2; ++i)
         if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
-    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    const unsigned char queue_description[0x28] = {};
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, queue_description, nullptr, &object)) return false;
     auto* queue = static_cast<Object*>(object);
     const unsigned count = static_cast<unsigned>(requests.size());
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;

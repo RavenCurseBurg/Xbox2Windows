@@ -11,7 +11,7 @@
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -19,6 +19,7 @@ struct Translation {
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
+    x2w_startup::D16ImageSrvs d16_srvs;         // manifest 'd16srv': texture views that must match proven D16 formats (#2023)
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -34,6 +35,9 @@ struct BoundPipeline {
     D3D12_BLEND_DESC blend{};
     bool has_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    bool depth_from_registers = false;  // X2W_DEPTH_STATE: depth_stencil was decoded from state block A (slot 57)
+    bool has_stencil_ref = false;       // ... and its stencil test is on: stencil_ref goes on the list with each draw
+    std::uint8_t stencil_ref = 0;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
@@ -161,6 +165,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "startinstance")) ud.kind = Translation::start_instance;
             else if (!std::strcmp(source, "rootconst")) ud.kind = Translation::root_constant;
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
+            else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
@@ -173,6 +178,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
                 return;
             }
+        } else if (line.compare(0, 7, "d16srv ") == 0) {
+            if (!tr.d16_srvs.read_manifest_line(line)) {
+                log("x2w-draw invalid d16srv manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
@@ -182,7 +192,12 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
-    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
+    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    for (const Translation::Ud& ud : tr.uds) {
+        if (ud.kind == Translation::d16_unorm16 &&
+            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
+            return;
+    }
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
     const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
@@ -221,6 +236,137 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
         load_translation(*entry);
     }
     return entry;
+}
+
+LONG compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words;
+
+// Device slot 67 (console compute program), 12 64-bit words: 0 (root signature), 1-2 and 3-4 (two state
+// blocks and sizes, a size of 0 meaning absent), 5-6 (program code and size), 7-8 (a second blob and size),
+// 9 and 10 (pointers whose targets are not decoded) and 11 (a value). The request carries .desc (the 12
+// words with the seven pointer words always zeroed, so no process address reaches a cache file or the key),
+// .sa, .sb, .data and .root, then .c67 (the code) last as the ready marker, for an offline compute stage
+// (tools/startup/gfx2hlsl.py). Any declared part that cannot be read refuses the whole request before a
+// file is written. The pipeline stays
+// a placeholder. Like the graphics path, a key is published once per cache whether or not a result exists.
+constexpr u64 compute_code_limit = 1u << 20, compute_data_limit = 1u << 20, compute_state_limit = 0x1000;
+
+// The key frames every part with its length, so moving bytes from one part to the next changes it.
+u64 fnv_part(const std::vector<unsigned char>& part, u64 key)
+{
+    const u64 bytes = part.size();
+    return fnv_bytes(part.data(), part.size(), fnv_bytes(&bytes, sizeof(bytes), key));
+}
+
+// A fault-safe copy of title memory: the parts are read once, then hashed, scanned and written from the copy,
+// so a title write in between cannot leave a file that does not match its key.
+bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept
+{
+    __try {
+        std::memcpy(to, from, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Aligned qwords of a published blob that name committed memory of this process (one VirtualQuery each, so
+// no fault is taken): such a value makes the key run-dependent. They are counted and published, not refused
+// (shortcut: hash-like values can name memory by chance; refuse once a decoder names the pointer fields).
+LONG pointer_like_qwords(const std::vector<unsigned char>& blob)
+{
+    LONG found = 0;
+    for (std::size_t at = 0; at + 8 <= blob.size(); at += 8) {
+        u64 value;
+        std::memcpy(&value, blob.data() + at, sizeof(value));
+        MEMORY_BASIC_INFORMATION info{};
+        if (value >= 0x10000 && value < 0x800000000000ull &&
+            VirtualQuery(reinterpret_cast<const void*>(value), &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT)
+            ++found;
+    }
+    return found;
+}
+
+SRWLOCK compute_request_lock = SRWLOCK_INIT;
+std::unordered_set<u64>& compute_keys_seen() { static std::unordered_set<u64> s; return s; }
+
+void publish_compute_request(const void* desc)
+{
+    wchar_t marker[MAX_PATH];
+    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return;  // publishing disabled
+    static LONG logged;
+    const char* refusal = nullptr;
+    u64 words[12]{};
+    std::vector<unsigned char> root_blob;
+    if (!desc || !x2w_local::readable(desc, sizeof(words)) || !copy_title_bytes(words, desc, sizeof(words)))
+        refusal = "description unreadable";
+    else {
+        if (Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]))) {
+            AcquireSRWLockShared(&note_lock);
+            const auto found = root_blobs().find(root);
+            if (found != root_blobs().end()) root_blob = found->second;
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (root_blob.empty()) refusal = "no root signature blob";
+    }
+    struct Part { int pointer; u64 limit; bool required; const char *zero, *over, *unreadable; };
+    static constexpr Part parts[4] = {
+        {5, compute_code_limit, true, "code size 0", "code size over 1 MiB", "code unreadable"},
+        {7, compute_data_limit, true, "data size 0", "data size over 1 MiB", "data unreadable"},
+        {1, compute_state_limit, false, nullptr, "state block A size over 4 KiB", "state block A unreadable"},
+        {3, compute_state_limit, false, nullptr, "state block B size over 4 KiB", "state block B unreadable"},
+    };
+    std::vector<unsigned char> copies[4];  // code, data, state A, state B
+    for (int i = 0; i < 4 && !refusal; ++i) {
+        const Part& p = parts[i];
+        const u64 bytes = words[p.pointer + 1];
+        const auto* at = reinterpret_cast<const void*>(words[p.pointer]);
+        if (!bytes) refusal = p.required ? p.zero : nullptr;
+        else if (bytes > p.limit) refusal = p.over;
+        else {
+            copies[i].resize(static_cast<std::size_t>(bytes));
+            if (!x2w_local::readable(at, copies[i].size()) || !copy_title_bytes(copies[i].data(), at, copies[i].size()))
+                refusal = p.unreadable;
+        }
+    }
+    if (refusal) {
+        InterlockedIncrement(&compute_requests_failed);
+        if (first_calls(logged, 12)) log("x2w-draw compute request not written: %s", refusal);
+        return;
+    }
+    const auto& [code, data, state_a, state_b] = copies;
+    // Pointer words never reach .desc or the key; 9 and 10 are not followed (shortcut: two descriptions that
+    // differ only in what they point to share a key; publish those targets once they are decoded).
+    std::vector<unsigned char> fields(sizeof(words));
+    words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
+    std::memcpy(fields.data(), words, sizeof(words));
+    constexpr char compute_revision[] = "x2w-startup-shader-8cs";  // tools/startup/gfx2hlsl.py compute_key
+    u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
+    const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
+    for (const auto* part : order) key = fnv_part(*part, key);
+    // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
+    // under draw_lock are not held up by request writes.
+    const auto write = [key](const wchar_t* ext, const std::vector<unsigned char>& part) {
+        static const unsigned char none = 0;  // a valid buffer for a 0-byte part
+        return publish_shader_request(key, ext, part.empty() ? &none : part.data(), part.size());
+    };
+    AcquireSRWLockExclusive(&compute_request_lock);
+    bool present = compute_keys_seen().count(key) != 0;
+    bool written = present;
+    if (!present) {
+        present = cache_path(marker, L"req_", key, L".c67") && GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES;
+        // Parts left by an interrupted earlier write are kept; the marker comes last, so the request completes here.
+        written = present || (write(L".desc", fields) && write(L".sa", state_a) && write(L".sb", state_b) &&
+                              write(L".data", data) && write(L".root", root_blob) && write(L".c67", code));
+        if (written) compute_keys_seen().insert(key);
+    }
+    ReleaseSRWLockExclusive(&compute_request_lock);
+    const LONG pointers = written && !present ? pointer_like_qwords(data) + pointer_like_qwords(state_a) + pointer_like_qwords(state_b) : 0;
+    if (pointers) InterlockedAdd(&compute_blob_pointer_words, pointers);
+    InterlockedIncrement(present ? &compute_requests_present : written ? &compute_requests_published : &compute_requests_failed);
+    if (first_calls(logged, 12))
+        log("x2w-draw compute request %016llx %s (code %llu bytes, data %llu bytes, state blocks %llu + %llu bytes, "
+            "pointer-like blob qwords %ld)", key, present ? "already present" : written ? "published" : "not written",
+            words[6], words[8], words[2], words[4], pointers);
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -389,6 +535,29 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         }
         bound->dsv_format = info->stream_dsv_format;
     }
+    // X2W_DEPTH_STATE=1 (#1999, item A): the depth-stencil registers of a slot 57 pipeline's state block A. A slot 57
+    // pipeline has no desktop DEPTH_STENCIL subobject, so has_depth_stencil can only be set here; the test keeps any
+    // desktop state that was found first. A block the decoder refuses leaves the desktop default (depth and stencil off).
+    if (info && info->path == 57 && !bound->has_depth_stencil && x2w_local::env_on("X2W_DEPTH_STATE")) {
+        const auto chosen = x2w_pipeline_state::select_depth_stencil(true, info->state_a.data(), info->state_a.size());
+        static LONG logged_applied, logged_refused;
+        if (chosen.applied) {
+            bound->depth_stencil = chosen.desc;
+            bound->has_depth_stencil = bound->depth_from_registers = true;
+            bound->has_stencil_ref = chosen.has_stencil_ref;
+            bound->stencil_ref = chosen.stencil_ref;
+        }
+        if (first_calls(chosen.applied ? logged_applied : logged_refused, 24)) {
+            if (chosen.applied)
+                log("x2w-draw pipeline %p: depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
+                    static_cast<void*>(pipeline), chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
+                    chosen.desc.StencilEnable, chosen.stencil_ref, chosen.depth_bounds ? "; depth bounds not applied" : "",
+                    chosen.masks_differ ? "; back-face masks or reference differ, front used" : "");
+            else
+                log("x2w-draw pipeline %p: depth-stencil registers not used (%s); keeping the desktop state", static_cast<void*>(pipeline),
+                    chosen.reason);
+        }
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -410,6 +579,22 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     }
     by_pipeline[pipeline] = bound;
     return bound;
+}
+
+// The request translation_for writes on a direct draw, for a pipeline that slot 61 refuses. Only direct draws poll
+// for the manifest afterwards. Count first lookups separately from published request files.
+LONG indirect_first_lookups;
+void request_translation(Wrapper* pipeline)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    const bool known = translation_by_pipeline().count(pipeline) != 0;
+    translation_for(pipeline);
+    ReleaseSRWLockExclusive(&draw_lock);
+    if (!known) InterlockedIncrement(&indirect_first_lookups);
+    static LONG lookups;
+    if (first_calls(lookups, 16))
+        log("x2w-render ExecuteIndirect looks up translation for pipeline %p (%s)", static_cast<void*>(pipeline),
+            known ? "already known" : "new");
 }
 
 bool needs_rtv_variant(DXGI_FORMAT format)
@@ -461,13 +646,21 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
+// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
+{
+    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+}
+
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
-    const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+    // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
+    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -486,7 +679,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         bound.pipelines[key] = nullptr;
         return nullptr;
     }
-    if (bound.has_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
+    if (use_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -896,6 +1089,70 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
+bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
+{
+    if (!tr.d16_srvs.any()) return true;
+    const auto refuse = [&](UINT slot, const char* reason, int detail) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-draw %016llx srv %u: d16 exact refused (%s %d)", tr.key, slot, reason, detail);
+        return false;
+    };
+    for (UINT i = 0; i < tr.srvs.size(); ++i) {
+        if (!tr.d16_srvs.requires_exact(i)) continue;
+        const Translation::Srv& srv = tr.srvs[i];
+        if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
+            return refuse(i, "non-table texture binding", srv.kind);
+        const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
+                               srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
+        std::uint32_t words[8] = {};
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
+            return refuse(i, "unreadable table entry", srv.a);
+        std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
+        ViewRecord record{};
+        bool known = false;
+        AcquireSRWLockShared(&note_lock);
+        known = words[1] < view_records().size();
+        if (known) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
+        Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+        ID3D12Resource* texture = sampled_address_texture(resource);
+        if (!texture) return refuse(i, "missing texture resource", 0);
+        if (x2w_startup::packed_stand_in_of(texture) != DXGI_FORMAT_UNKNOWN)
+            return refuse(i, "packed stand-in resource", static_cast<int>(x2w_startup::packed_stand_in_of(texture)));
+        const D3D12_RESOURCE_DESC tex_desc = texture->GetDesc();
+        if (srv.kind == 4 && (tex_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || tex_desc.DepthOrArraySize != 1))
+            return refuse(i, "1D resource mismatch", static_cast<int>(tex_desc.Dimension));
+        const auto* original = resource_info(resource);
+        DXGI_FORMAT effective = original ? original->console.Format : tex_desc.Format;
+        if (record.desc_bytes >= 40) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+            std::memcpy(&desc, record.desc, 40);
+            if (desc.ViewDimension != dimension)
+                return refuse(i, "view dimension", static_cast<int>(desc.ViewDimension));
+            if (desc.Format != DXGI_FORMAT_UNKNOWN) effective = desc.Format;
+        } else if (record.desc_bytes == 0) {
+            const bool dim_ok =
+                (srv.kind == 1 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && tex_desc.DepthOrArraySize == 1) ||
+                (srv.kind == 2 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
+                (srv.kind == 3 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
+                (srv.kind == 4 && tex_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && tex_desc.DepthOrArraySize == 1);
+            if (!dim_ok) return refuse(i, "default view dimension", static_cast<int>(tex_desc.Dimension));
+        } else {
+            return refuse(i, "truncated view desc", static_cast<int>(record.desc_bytes));
+        }
+        const auto mode = x2w_startup::d16_srv_mode(effective);
+        if (mode == x2w_startup::D16SrvMode::refused)
+            return refuse(i, "format", static_cast<int>(effective));
+        d16_unorm16[i] = mode == x2w_startup::D16SrvMode::unorm16 ? 1u : 0u;
+    }
+    return true;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     auto* list = recording(self);
@@ -905,7 +1162,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
-    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
+    std::uint32_t d16_unorm16[32] = {};
+    if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16)) {
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -1141,7 +1403,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
-            : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
+            : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
+            : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a] : 0;
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
@@ -1161,6 +1424,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     list->SetPipelineState(pipeline);
+    // X2W_DEPTH_STATE: the reference of the decoded stencil test is list state in D3D12. It replaces the one a
+    // preceding OMSetStencilRef set, for draws of this pipeline only when a depth view is bound.
+    const bool scoped_stencil_ref = bound->depth_from_registers && bound->has_stencil_ref &&
+                                    pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN &&
+                                    bound->stencil_ref != pass.stencil_reference;
+    if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
     list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
     if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
@@ -1188,6 +1457,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         drawn = true;
     }
+    if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) draw_dump_after(self, list, tr->key, count);
     ReleaseSRWLockExclusive(&draw_lock);
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
