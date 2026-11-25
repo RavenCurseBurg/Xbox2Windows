@@ -1,59 +1,56 @@
-name: Build and run the slot 67 indirect fixture
+name: Check the published multi-record ExecuteIndirect cases
 on:
   push:
-    branches: ['verify/slot67-indirect-dispatch']
+    branches: [verify/2626-indirect-dispatch-adapters]
 permissions:
   contents: read
 jobs:
-  timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/slot67-indirect-dispatch'
+  compare:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: bd5583709917d949141011f2fcd00c0c7661a18b
           persist-credentials: false
-      - name: Build the stream consumer and collect source digests
+      - name: Compile the reported program and its adapter and count controls
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           ./tools/dev.ps1
-          python -m venv out/pe-env
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','startup_indirect_dispatch.exe') {
-            $files = @(Get-ChildItem out/build/release -File -Recurse -Filter $name)
-            if ($files.Count -ne 1) { throw "Expected one built $name" }
-            Copy-Item -LiteralPath $files[0].FullName -Destination $stage
+          New-Item -ItemType Directory out/indirect2626 -Force | Out-Null
+          Set-Location out/indirect2626
+          $body = (gh api repos/R0Y00/Xbox2Windows/issues/2626 | ConvertFrom-Json).body.Replace("`r`n", "`n")
+          $matchesCpp = [regex]::Matches($body, '(?ms)^\x60{3}cpp\n(.*?)^\x60{3}$')
+          if ($matchesCpp.Count -ne 1) {throw 'Expected one public source block'}
+          $source = $matchesCpp[0].Groups[1].Value
+          [IO.File]::WriteAllText("$PWD/ei2.cpp", $source)
+          if ((Get-FileHash ei2.cpp).Hash -ne '10B5264DBB2FB0547229CE9B3BC75095FFDAC452CD34B98844CE131D211AA50D') {throw 'Public source changed'}
+          $low = $source.Replace('DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE', 'DXGI_GPU_PREFERENCE_MINIMUM_POWER')
+          $one = $source.Replace('l->ExecuteIndirect(sig.Get(), o.maxCount, src, 0, nullptr, 0);', 'l->ExecuteIndirect(sig.Get(), 1, src, 0, nullptr, 0);')
+          if ($source -eq $low -or $source -eq $one) {throw 'Control substitution did not occur'}
+          [IO.File]::WriteAllText("$PWD/ei2-minpower.cpp", $low)
+          [IO.File]::WriteAllText("$PWD/ei2-first-only.cpp", $one)
+          foreach ($name in 'ei2','ei2-minpower','ei2-first-only') {
+            cl.exe /nologo /EHsc /O2 /MT /std:c++17 "$name.cpp" "/Fe:$name.exe"
+            if ($LASTEXITCODE) {exit $LASTEXITCODE}
           }
-          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
-          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+          $normal = .\ei2.exe warp
+          $control = .\ei2-first-only.exe warp
+          $normal | Tee-Object -FilePath normal-warp.log
+          $control | Tee-Object -FilePath first-only-warp.log
+          if (@($normal -match ' ok$').Count -ne 9) {throw 'Expected all nine original cases to pass on WARP'}
+          if (@($control -match ' MISMATCH$').Count -ne 8 -or @($control -match '^8 .* ok$').Count -ne 1) {throw 'First-record control failed'}
+          (git rev-parse HEAD) | Set-Content -Encoding ascii SOURCE_COMMIT.txt
+          Get-ChildItem -File | Where-Object Extension -ne '.obj' | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: slot67-consumer
-          path: out/mrt-artifact/
-          retention-days: 2
-          if-no-files-found: error
-      - name: Run the new and existing dispatch fixtures on WARP
-        shell: pwsh
-        run: |
-          ./tools/dev.ps1
-          out/pe-env/Scripts/python.exe -B tests/startup_slot67_indirect_dispatch_check.py mutation
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(slot67_indirect_dispatch|compute_dispatch|indirect_dispatch|indirect_count|indirect_root_constants)_warp$' 2>&1
-          $result=$LASTEXITCODE
-          $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
-          if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: slot67-results
-          path: out/slot67-warp.log
-          if-no-files-found: ignore
+          name: indirect2626-results
+          path: |
+            out/indirect2626/*.exe
+            out/indirect2626/*.cpp
+            out/indirect2626/*.log
+            out/indirect2626/SOURCE_COMMIT.txt
+            out/indirect2626/SHA256SUMS
           retention-days: 2
