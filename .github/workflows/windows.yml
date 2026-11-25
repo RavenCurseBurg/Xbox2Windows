@@ -11,10 +11,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: exact
-            source: 3d596a2845e3267eb530f2dad2ee0524d5105476
-          - label: lifetime
-            source: 966a3b8db4d6a3642c02f3d9b6b1c810b933b901
+          - label: parent-fix
+            source: 7a8d9c8928e7db2eb0c1721d025851733aaff68d
+          - label: both-fixtures
+            source: 5899e6df24f5fbc572017c3e878a656ecdc41c3e
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -52,7 +52,7 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(compute_live_retry|compute_dispatch)_warp$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(compute_live_retry|compute_dispatch|slot67_indirect_dispatch|indirect_dispatch|indirect_root_constants|indirect_count)_warp$' 2>&1
           $result=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
           if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
