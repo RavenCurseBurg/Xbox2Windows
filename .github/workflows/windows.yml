@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: f0402dd1d1dbf7da74014620808448cbe2ffcef9
+          ref: ee748000a9f2de89d32b39cef4884d935538bef5
           persist-credentials: false
       - name: Build the renderer
         shell: pwsh
