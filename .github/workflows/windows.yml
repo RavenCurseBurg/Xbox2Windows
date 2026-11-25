@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 17ab11a83b6a866425ae9be14834dff4a9242f01
+          ref: c601e6e9dcee2a96fc5b103f0bfedfe39557002d
           persist-credentials: false
       - name: Identify the toolset
         id: toolset
@@ -41,7 +41,7 @@ jobs:
           if (Test-Path out/W/D3D12) { Copy-Item out/W/D3D12 -Recurse -Destination $stage }
           Copy-Item $bin -Recurse -Destination (Join-Path $stage 'tools')
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
-          Get-ChildItem $stage -File -Recurse | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+          Get-ChildItem $stage -File -Recurse -Exclude SHA256SUMS | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: split-sampler-readback-build
@@ -54,9 +54,12 @@ jobs:
           ./tools/dev.ps1
           $lines=ctest --test-dir out/W --no-tests=error -V -R '^(spirv_sampler_views|sampler_index_control)_warp$' 2>&1
           $rc=$LASTEXITCODE
-          $lines | Select-String 'sampler table:|sampler swap|control=|debug_layer=|debug_errors=|100% tests'
+          $lines | Select-String 'sampler table:|sampler swap|control=|debug_layer=|debug_errors=|100% tests|missing comparison stores detected|swap 1 word'
           if ($rc -or $lines -match '\*\*\*Skipped|Not Run') { throw "Failed or skipped test ($rc)" }
           foreach ($line in 'sampler swap 0: sample 0.25 0.75, comparison 0 1','sampler swap 1: sample 0.75 0.25, comparison 0 1','sampler swap 2: sample 0.25 0.75, comparison 1 0') {
             if (@($lines | Select-String -SimpleMatch $line).Count -ne 2) { throw "Missing both tables for $line" }
           }
           if (@($lines -match 'debug_layer=enabled').Count -ne 3 -or -not ($lines -match 'dispatch_thread_control=pass group_index_reproduction=matches')) { throw 'Missing paired direct control or debug layer' }
+          foreach ($line in 'sampler swap 1 word 2: expected=00000000 actual=c0400000','sampler swap 1 word 3: expected=3f800000 actual=c0800000') {
+            if (@($lines | Select-String -SimpleMatch $line).Count -ne 1) { throw "Missing negative readback: $line" }
+          }
