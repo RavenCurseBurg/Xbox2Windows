@@ -51,5 +51,5 @@ jobs:
           $lines=ctest --test-dir out/W --no-tests=error -V -R '^(startup_stream_adapter_filter|startup_(stream_draw|stream_depth|stream_rasterizer|slot57_depth|draw_depth_target)_warp)$' 2>&1
           $rc=$LASTEXITCODE
           $lines | Select-String 'adapter=|overlong and unmatched|eight cull|slot 57|depth target occluded|32 pixels|100% tests|\*\*\*|debug layer:'
-          if ($rc -or $lines -match '\*\*\*Skipped|Not Run' -or -not ($lines -match '0 tests failed out of 6')) { $lines | Select-Object -Last 120; throw "Expected six passing CTests ($rc)" }
+          if ($rc -or $lines -match '\*\*\*Skipped|Not Run' -or -not ($lines -match '100% tests passed(, 0 tests failed)? out of 6')) { $lines | Select-Object -Last 120; throw "Expected six passing CTests ($rc)" }
           if (-not ($lines -match 'overlong and unmatched hardware adapter filters rejected') -or -not ($lines -match 'eight cull/winding images matched')) { throw 'Missing negative selection or WARP readback' }
