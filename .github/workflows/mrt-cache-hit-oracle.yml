@@ -1,0 +1,73 @@
+name: Compare MRT tests with a compiled base cache hit
+on:
+  push:
+    branches: [verify/mrt-cache-hit-oracle]
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
+    runs-on: windows-2025
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: normal
+            source: 5072dc87677c94acaed5e6e52a2dd809cf951006
+          - label: skip-republication
+            source: 993c6944d46b217e224244da74d3d6f88c3bfa8e
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ matrix.source }}
+          fetch-depth: 5
+          persist-credentials: false
+      - name: Build the stream consumer
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          cmake --build --preset release --target startup_stream_consumer
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          $stage = New-Item -Type Directory -Force out/consumer
+          foreach ($name in 'startup_stream_consumer.exe','d3d12_xs.dll','xg_xs.dll') {
+            Copy-Item -LiteralPath "out/build/release/$name" -Destination $stage
+          }
+          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
+          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mrt-consumer-${{ matrix.label }}
+          path: out/consumer/
+          retention-days: 2
+      - name: Compare the original, parallel and repaired fixtures
+        shell: pwsh
+        env:
+          NATIVE_MODE: ${{ matrix.label }}
+        run: |
+          ./tools/dev.ps1
+          foreach ($rev in 'fb2f86ac53fb91b40fde6a78bd753961610752f1','869d8d455489025b21533704c292a795f1c496d5','5072dc87677c94acaed5e6e52a2dd809cf951006') {
+            git restore --source=$rev -- tests/startup_mrt_check.py
+            if ($LASTEXITCODE) {exit $LASTEXITCODE}
+            $rows = ctest --preset release --no-tests=error -V -R '^startup_mrt_fxc_warp$' 2>&1
+            $rc = $LASTEXITCODE
+            $short = $rev.Substring(0,8)
+            $rows | Set-Content -Encoding utf8 "out/mrt-$short.log"
+            $rows | Select-Object -Last 14
+            $shouldPass = $env:NATIVE_MODE -eq 'normal' -or $short -eq '869d8d45'
+            if ($rows -match 'Not Run|\*\*\*Skipped' -or (($rc -eq 0) -ne $shouldPass)) {
+              throw "$short on $env:NATIVE_MODE returned $rc, expected pass=$shouldPass"
+            }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mrt-logs-${{ matrix.label }}
+          path: out/mrt-*.log
+          retention-days: 2
