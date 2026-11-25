@@ -37,7 +37,7 @@ jobs:
           ctest --test-dir out/d16-check --no-tests=error -V -R '^(startup_gfx2hlsl_image_get_lod_controls|startup_image_(get_lod_view|2d_array|sample_lod)_warp)$' | Tee-Object out/lod-warp.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $log = Get-Content -Raw out/lod-warp.log
-          if ($log -match '\*\*\*Skipped|\*\*\*Not Run' -or $log -notmatch '4 tests passed|4 tests out of 4|0 tests failed out of 4') { throw 'Missing selected WARP tests' }
+          if ($log -match '\*\*\*Skipped|\*\*\*Not Run' -or $log -notmatch '100% tests passed[^\r\n]*out of 4') { throw 'Missing selected WARP tests' }
           foreach ($expected in 'debug_layer=enabled','debug_errors=0 debug_warnings=0','ordinary sampler control rgba=40000000400000004000000040000000','view=1/1 step=1') {
             if (!$log.Contains($expected)) { throw "Missing output: $expected" }
           }
