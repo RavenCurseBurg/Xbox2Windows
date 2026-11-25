@@ -1,20 +1,20 @@
-name: Build the two-SRV guest graphics fixture
+name: Verify formatted slot 57 mesh readbacks
 on:
   push:
-    branches: ['verify/graphics-joined-table']
+    branches: ['verify/mesh57-formatted-readback']
 permissions:
   contents: read
 jobs:
-  timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/graphics-joined-table'
+  verify:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 1bf7826217e7c18b53676649fb7a375323e5b565
+          ref: f0402dd1d1dbf7da74014620808448cbe2ffcef9
           persist-credentials: false
-      - name: Build the stream consumer and collect source digests
+      - name: Build the renderer
         shell: pwsh
         run: |
           ./tools/dev.ps1
@@ -22,43 +22,34 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer offscreen_check
+          cmake --build --preset release --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','offscreen_check.exe') {
-            $files = @(Get-ChildItem out/mrt -File -Recurse -Filter $name)
-            if ($files.Count -ne 1) { throw "Expected one built $name" }
-            Copy-Item -LiteralPath $files[0].FullName -Destination $stage
-          }
+          $stage = New-Item -ItemType Directory -Force out/mesh57-renderer
+          Copy-Item out/build/release/offscreen_check.exe -Destination $stage
+          if (Test-Path out/build/release/D3D12) {Copy-Item out/build/release/D3D12 -Recurse -Destination $stage}
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
-          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+          Get-ChildItem $stage -Recurse -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: joined-table-consumer
-          path: out/mrt-artifact/
-          retention-days: 2
+          name: mesh57-renderer
+          path: out/mesh57-renderer/
           if-no-files-found: error
-      - name: Run the guest table readback with both compilers
+          retention-days: 2
+      - name: Run slot 57 host and WARP readbacks
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_(joined_table_pointer_(cpu|(fxc|dxc)_warp)|gfx2hlsl_compute_(controls|warp))$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_mesh57_(skeleton(_draw_warp)?|formatted_load_warp)$' 2>&1
           $rc=$LASTEXITCODE
-          $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
-          if (-not ($rows -match 'case I-raw: all 320 words match')) {throw 'Missing structured-to-raw compute readback'}
-          foreach ($kind in 'fxc','dxc') {
-            foreach ($change in 0,32) {
-              $seen=@($rows | Select-String -Pattern "$kind warp table byte (0|32), $change pixels changed from the source expectation")
-              if ($seen.Count -ne 5) {throw "Expected five $kind readbacks with $change changed pixels, got $($seen.Count)"}
-            }
-          }
+          $rows | Set-Content out/mesh57-formatted.log
+          $rows | Select-Object -Last 17
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped test ($rc)"}
+          if (@($rows | Select-String '0 differing pixels$').Count -ne 3 -or @($rows | Select-String '259 differing pixels$').Count -ne 2) {throw 'Missing reference readbacks'}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: joined-table-ctest
-          path: out/graphics-table.log
-          if-no-files-found: ignore
+          name: mesh57-log
+          path: out/mesh57-formatted.log
           retention-days: 2
