@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: be690e82a2a137d6003f92e920293ba6c3b4b963
+          ref: 8a689dcdbabcb1aabf55619807db88906c408639
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
