@@ -31,8 +31,11 @@ PROGRAM = bytes.fromhex('06038abe80038bbe05030cf4000000fa7fc08cbf0702067e8206083
 
 def setup(directory, adapter):
     cache, env = prepare(directory)
-    env.update(X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'), X2W_D3D12_LIST_NOOP='1',
-               X2W_D3D12_DEBUG='1', X2W_TEST_DISPATCH_HARDWARE='1' if adapter == 'hardware' else '')
+    env.update(X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'), X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')
+    if adapter == 'hardware':
+        env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
+    else:
+        env.pop('X2W_TEST_DISPATCH_HARDWARE', None)
     (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
     (directory / 'program').write_bytes(PROGRAM)
     (directory / 'data').write_bytes(DATA)
@@ -73,6 +76,12 @@ def main(consumer, dxc, adapter):
         for groups in (2, 5, 0):
             run = check(directory, consumer, env, str(groups) if groups else 'zero', groups, groups)
             assert not lines(run, 'refused:'), run.stderr[-2500:]
+        for mode, reason in (('multi', 'one rootless command'), ('counted', 'no count buffer'),
+                             ('outside', 'outside a unique placed buffer'), ('output-alias', 'also a bound shader resource')):
+            run = check(directory, consumer, env, mode, 5, 0)
+            refusals = lines(run, 'ExecuteIndirect refused')
+            assert len(refusals) == 1 and reason in refusals[0], run.stderr[-2500:]
+            print(refusals[0])
         layer = lines(run, 'x2w-d3d12 debug layer: ')
         print('debug layer:', 'enabled' if layer and '0x00000000' in layer[0] else 'unavailable')
 

@@ -52,7 +52,7 @@ void Slot67Indirect::prepare(IDXGIAdapter* adapter, void* guest_device, void* gu
         ComPtr<ID3DBlob> blob, code;
         check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "serialize producer root");
         check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)), "create producer root");
-        check(D3DCompile(producer, sizeof(producer)-1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
+        check(D3DCompile(producer, sizeof(producer) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
                          &code, nullptr), "compile indirect producer");
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
         pso.pRootSignature = root.Get();
@@ -72,9 +72,10 @@ void Slot67Indirect::prepare(IDXGIAdapter* adapter, void* guest_device, void* gu
     check(guest->CreateCommandSignature(&sig, nullptr, IID_PPV_ARGS(&signature)), "create guest dispatch signature");
 }
 
-void Slot67Indirect::execute(void* list) const
+void Slot67Indirect::execute(void* list, UINT commands, bool count_buffer, bool outside) const
 {
-    invoke(list, 61, word(signature.Get()), 1, word(placed.Get()), offset, 0, 0);
+    invoke(list, 61, word(signature.Get()), commands, word(placed.Get()), outside ? sizeof(initial) - sizeof(UINT) : offset,
+           count_buffer ? word(placed.Get()) : 0, count_buffer ? offset : 0);
 }
 
 bool Slot67Indirect::check_record(UINT groups) const

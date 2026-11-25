@@ -176,8 +176,8 @@ static void* slot67_root;
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
-    const bool indirect = mode == "dispatch-indirect-2" || mode == "dispatch-indirect-5" || mode == "dispatch-indirect-zero";
-    const UINT groups = mode == "dispatch-indirect-2" ? 2u : mode == "dispatch-indirect-5" ? 5u : 0u;
+    const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
@@ -211,6 +211,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
+    if (mode == "dispatch-indirect-output-alias") {
+        const UINT64 address = reinterpret_cast<UINT64>(memory) + 0x20000;
+        const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 5, 0};
+        std::memcpy(descriptors[1], alias, sizeof(alias));
+    }
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     const UINT constants[2] = {0x01234567, 0x9e3779b9};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
@@ -221,7 +226,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     invoke(list, 33, word(slot67_root));
     invoke(list, 39, 0, 2, word(constants), 0);
     invoke(list, 35, 1, gpu);
-    if (indirect) record.execute(list);
+    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+                                 mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));

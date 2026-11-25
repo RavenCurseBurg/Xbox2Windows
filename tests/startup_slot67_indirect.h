@@ -11,6 +11,6 @@ struct Slot67Indirect {
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> signature;
 
     void prepare(IDXGIAdapter* adapter, void* guest_device, void* guest_list, void* backing, UINT groups);
-    void execute(void* guest_list) const;
+    void execute(void* guest_list, UINT commands, bool count_buffer, bool outside) const;
     bool check_record(UINT groups) const;
 };

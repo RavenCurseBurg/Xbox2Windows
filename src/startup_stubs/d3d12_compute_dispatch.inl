@@ -81,14 +81,14 @@ const char* load_compute_translation(ComputeTranslation& tr)
     return nullptr;
 }
 
-// True when the bound pipeline is a slot 67 placeholder with a request key: the call is then settled here
-// (dispatched, or refused and logged). False leaves it to the desktop-pipeline decision of list_dispatch.
-bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
+// Both callers have an open list and a slot 67 request. The indirect caller has also validated the
+// signature and placed argument range. All resource checks precede the first recorded state change.
+const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const u64 key = list && pass.pipeline ? pass.pipeline->own().compute_request_key : 0;
-    if (!key) return false;
+    const u64 key = pass.pipeline->own().compute_request_key;
+    const auto [x, y, z] = dispatch.groups;
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View { ID3D12Resource* resource; u64 offset, bytes; bool transition; } views[40]{};
@@ -146,13 +146,17 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
     }
+    if (dispatch.argument)
+        for (std::size_t i = 0; i < count && !reason; ++i)
+            if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
     if (reason) {
         ReleaseSRWLockExclusive(&draw_lock);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
-        if (first_calls(counter == &compute_dispatches_untranslated ? untranslated : refusals, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
-        return true;
+        if (!dispatch.signature && first_calls(counter == &compute_dispatches_untranslated ? untranslated : refusals, 16))
+            log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
+        return reason;
     }
     const UINT n = static_cast<UINT>(count);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
@@ -188,7 +192,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     list->SetComputeRootSignature(tr->root.Get());
     list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
-    list->Dispatch(x, y, z);
+    if (dispatch.signature) {
+        require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
+    } else {
+        list->Dispatch(x, y, z);
+    }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -202,11 +211,11 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             if (const auto address = pass.desktop_compute_upload_srvs[parameter]) list->SetComputeRootShaderResourceView(parameter, address);
     }
     ReleaseSRWLockExclusive(&draw_lock);
-    check_device("translated dispatch", 14);
+    check_device("translated dispatch", dispatch.signature ? 61 : 14);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
-    if (first_calls(logged, 8))
+    if (!dispatch.signature && first_calls(logged, 8))
         log("x2w-draw compute %016llx Dispatch(%u, %u, %u) translated: entry [%x %x %x %x], %zu inputs, %zu outputs", key, x, y, z,
             values[0], values[1], values[2], values[3], inputs, count - inputs);
-    return true;
+    return nullptr;
 }
