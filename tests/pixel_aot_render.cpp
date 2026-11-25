@@ -387,12 +387,15 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ComPtr<ID3D12QueryHeap> queries;
         ComPtr<ID3D12Resource> queryResults;
+        char queryMode[2]{};
+        const bool adjacent = GetEnvironmentVariableA("X2W_COV_ADJACENT", queryMode, sizeof(queryMode)) == 1 &&
+                              queryMode[0] == '1';
         if (!input.coverage.empty()) {
             const UINT pixels = width * height;
             if (pixels != input.coverage.size()) throw std::runtime_error("Coverage reference extent");
-            D3D12_QUERY_HEAP_DESC queryDesc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, pixels + 1, 0};
+            D3D12_QUERY_HEAP_DESC queryDesc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, pixels + 2, 0};
             check(device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&queries)), "Coverage queries");
-            queryResults = make_buffer(device, (pixels + 1) * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+            queryResults = make_buffer(device, (pixels + 2) * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
             // First measure a full draw with neighboring lanes active, then locate
             // each surviving sample with a one-pixel scissor.
@@ -405,8 +408,17 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, i);
                 list->DrawInstanced(3, 1, 0, 0);
                 list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, i);
+                if (adjacent && i == 0) {
+                    list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, pixels + 1);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, pixels + 1);
+                }
             }
-            list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, pixels + 1, queryResults.Get(), 0);
+            if (!adjacent) {
+                list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, pixels + 1);
+                list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, pixels + 1);
+            }
+            list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, pixels + 2, queryResults.Get(), 0);
         } else if (partialTriangle) {
             const D3D12_INDEX_BUFFER_VIEW indices{partialTriangle->GetGPUVirtualAddress(),
                                                    3 * sizeof(Word), DXGI_FORMAT_R32_UINT};
@@ -425,7 +437,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->CopyTextureRegion(&dst, 0,0,0, &src, nullptr);
         cmd.submit_and_wait(device);
         if (queryResults) {
-            auto counts = read(queryResults.Get(), (input.coverage.size() + 1) * 2);
+            auto counts = read(queryResults.Get(), (input.coverage.size() + 2) * 2);
             UINT sum = 0;
             for (size_t i = 0; i < input.coverage.size(); ++i) {
                 sum += input.coverage[i];
@@ -434,6 +446,11 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                     throw std::runtime_error("Sample coverage mismatch");
                 }
             }
+            const auto count = [&](size_t index) {
+                return (UINT64(counts[2 * index + 1]) << 32) | counts[2 * index];
+            };
+            std::printf("coverage_record adjacent=%d first=%llu second=%llu one_pixel_sum=%u\n", int(adjacent),
+                        count(0), count(input.coverage.size() + 1), sum);
             if (counts[0] != sum || counts[1]) throw std::runtime_error("Full draw coverage mismatch");
             std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
         }
