@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 0a76af4744292a7c5396727c1528c75b6b093d2c
+          ref: cf30dc3469ceed3569059b42a6dab656c2df7506
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
