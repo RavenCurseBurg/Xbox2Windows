@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 55f9d550aaf9d2e96b543906014c40a927be2c6e
+          ref: ce054dfc6551832eebd35c608d15fb0db7233ab3
           persist-credentials: false
       - name: Build the test renderer and run both WARP compilers
         shell: pwsh
@@ -34,7 +34,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $kind=if ($env:PRESET -eq 'dev') { 'Debug' } else { 'Release' }
           if (-not (Select-String -Path "out/build/$env:PRESET/CMakeCache.txt" -Pattern "^CMAKE_BUILD_TYPE:STRING=$kind$")) { throw 'Unexpected build preset configuration' }
-          if ((git rev-parse HEAD) -ne '55f9d550aaf9d2e96b543906014c40a927be2c6e') { throw 'Wrong checkout' }
+          if ((git rev-parse HEAD) -ne 'ce054dfc6551832eebd35c608d15fb0db7233ab3') { throw 'Wrong checkout' }
           cmake --build --preset $env:PRESET --target startup_stream_consumer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $lines = ctest --preset $env:PRESET --no-tests=error -V -R '^(startup_mrt_(fxc|dxc)_warp|startup_gfx2hlsl_export_mask)$' 2>&1
