@@ -14826,7 +14826,12 @@ The zeroed record leaves the whole output untouched when the producer is omitted
 also preserves the output and logs the refusal. Additional cases cover multiple commands, a count buffer,
 an out-of-range record and using the argument buffer as a shader output.
 
+The device-free check uses the same word comparator as the GPU readback. It flips individual
+written and untouched words, checks short and long readbacks, and verifies that the two group
+counts produce different reference values only at indices 2, 3 and 4.
+
 ```powershell
+python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
 ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
 ```
