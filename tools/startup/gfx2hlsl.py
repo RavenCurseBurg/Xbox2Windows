@@ -599,8 +599,10 @@ def names_one_value(sym):
         return False
     if sym[0] == 'desc':
         return len(sym) == 4  # ('desc', source, load offset, dword); the 'modified' mark drops the written value
-    # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
-    # untouched pointer, exactly (kind, source), names one value.
+    # A table and a known byte offset identify one descriptor address. The legacy 'added'
+    # marker carries no offset, so two occurrences of it can denote different addresses.
+    if sym[0] == 'ptr' and len(sym) == 3 and sym[1][0] == 'table':
+        return isinstance(sym[2], int)
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
@@ -1636,6 +1638,10 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        # Forward edges reach each block in disassembly order. A back edge could
+        # repeat a pointer advance before the next table load.
+        self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
+                                   and all(target > pc for pc, target in branches))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
@@ -2376,8 +2382,9 @@ class Stage:
         if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
             return False
         if getattr(self, 'has_branches', False):
-            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
-            return False
+            if (not getattr(self, 'forward_table_adds', False) or base != 's_add_u32'
+                    or syms[0][0] != 'ptr' or syms[0][1][0] != 'table'):
+                return False
         reg = reg_range(dname)
         if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
             return False
@@ -2388,7 +2395,12 @@ class Stage:
             added = int(srcs[1], 0)
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
-            self.sym[d] = ('ptr', syms[0][1], (syms[0][2] if len(syms[0]) > 2 else 0) + added)
+            offset = syms[0][2] if len(syms[0]) > 2 else 0
+            if not isinstance(offset, int):
+                raise Unsupported('add through a pointer with unknown byte offset')
+            if getattr(self, 'forward_table_adds', False) and offset + added > 0xfffff:
+                raise Unsupported('accumulated table pointer offset %#x' % (offset + added))
+            self.sym[d] = ('ptr', syms[0][1], offset + added)
             if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
                 # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
                 # instruction starts so that the high-word add is accepted right behind it and nowhere else.
@@ -2505,7 +2517,7 @@ class Stage:
                     if not stride0:
                         getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
-                    self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
+                    self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -2797,6 +2809,8 @@ class Stage:
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
+        if not isinstance(base_off, int):
+            raise Unsupported('s_load through a pointer with unknown byte offset')
         if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
             # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
             # a table pointer is 32 bits wide and has no high word.
