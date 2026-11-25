@@ -3,7 +3,8 @@
 usage: startup_compute_dispatch_check.py <startup_stream_consumer> <dxc> <warp|hardware>
 
 The consumer creates case A of startup_gfx2hlsl_compute_check.py as a device slot 67 pipeline and records, on a
-stand-in list, the descriptor heap, the pipeline, its root signature, two root constants, one table of two
+stand-in list, the descriptor heap, the pipeline, its root signature, two root constants (word 0 by slot 37, word 1
+by slot 39, with a slot 40 call of other words in between), one table of two
 hardware buffer descriptors and Dispatch(3, 2, 2). Input and output are placed buffers that alias the consumer's
 memory; the output words are read from that memory after the queue's fence. Four runs share one cache:
 
@@ -12,7 +13,12 @@ memory; the output words are read from that memory after the queue's fence. Four
 2. after gfx2hlsl.py --pending with DXC: all 320 words equal the case's expectation;
 3. dispatch-none (no Dispatch recorded): every word keeps the sentinel;
 4. dispatch-swapped (the two descriptors exchanged, so the output names the buffer without unordered access):
-   refused with one logged reason, every word keeps the sentinel and the input is unchanged.
+   refused with one logged reason, every word keeps the sentinel and the input is unchanged;
+5. dispatch-same-root (the same compute root set again after the constants): all 320 words still match;
+6. five more refusals, each with its one logged reason and an untouched output: dispatch-missing-word (no slot 37
+   call), dispatch-root-changed (another compute root and back after the constants), dispatch-reset (list closed
+   and reset after the constants), dispatch-wrong-root (recorded under a root the pipeline was not created with)
+   and dispatch-same-buffer (the output buffer is also the input).
 Exit 77 when the adapter is not available.
 """
 import os
@@ -92,8 +98,19 @@ def main(consumer, dxc, adapter):
         refused = lines(result, 'refused: ')
         assert len(refused) == 1 and 'an output is not an aliased placed buffer range with unordered access' in refused[0], \
             result.stderr[-3000:]
-        print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation; untouched '
-              'before translation, without a Dispatch and for a refused output)')
+        got, result = dispatch(directory, consumer, env, 'dispatch-same-root')
+        assert got == expected and not lines(result, 'refused'), 'setting the same compute root again lost the constants'
+
+        unset = 'an entry value was not set since the compute root'
+        for mode, reason in (('dispatch-missing-word', unset), ('dispatch-root-changed', unset), ('dispatch-reset', unset),
+                             ('dispatch-wrong-root', 'the compute root set is not the one the pipeline was created with'),
+                             ('dispatch-same-buffer', 'an output buffer is also an input')):
+            got, result = dispatch(directory, consumer, env, mode)
+            assert got == untouched, f'{mode}: a refused Dispatch wrote the output'
+            refused = lines(result, 'refused: ')
+            assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), f'{mode}: {refused}\n{result.stderr[-3000:]}'
+        print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation and with the '
+              'same root set again; untouched before translation, without a Dispatch and for 6 refusals)')
 
 
 if __name__ == '__main__':

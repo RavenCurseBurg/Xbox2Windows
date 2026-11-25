@@ -14,6 +14,15 @@ struct ComputeTranslation {
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    ~ComputeTranslation()
+    {
+        // The per-process cache is destroyed during DLL detach. A driver may already have shut
+        // down when the process is terminating. Explicit unload still releases both references.
+        if (x2w_d3d12_process_terminating) {
+            pipeline.Detach();
+            root.Detach();
+        }
+    }
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated;
@@ -113,6 +122,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             counter = &compute_dispatches_untranslated;
         }
     }
+    // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
+    for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
+        if (!pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1)) reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;

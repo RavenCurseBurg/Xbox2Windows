@@ -227,6 +227,13 @@ extern "C" HRESULT WINAPI d3d12_xs_CreateRootSignatureDeserializer(
 
 bool x2w_d3d12_permissive();
 HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parameters, REFIID iid, void** device);
+extern bool x2w_d3d12_process_terminating;
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_DETACH && reserved) x2w_d3d12_process_terminating = true;
+    return TRUE;
+}
 
 extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     IUnknown* adapter, const void* parameters, REFIID iid, void** device)
