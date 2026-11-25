@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 45e6bc6fcf1ebd6a202e293e6aa829ed1fa3299b
+          ref: 98319c2e0382e0ca863a5e04c1d31b184f4a8d70
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -44,7 +44,7 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_(joined_table_pointer_(cpu|(fxc|dxc)_warp)|gfx2hlsl_(buffer_store|compute_(controls|warp)))$' 2>&1
+          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_(joined_table_pointer_(cpu|(fxc|dxc)_warp)|gfx2hlsl_(buffer_store|compute_(controls|warp))|smem_address_(controls|warp))$' 2>&1
           $rc=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
           if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
