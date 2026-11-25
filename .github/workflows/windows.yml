@@ -4,13 +4,13 @@ permissions:
   contents: read
 jobs:
   fixtures:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/windows-runner-output'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/launcher-cleanup'
     runs-on: windows-2025
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 630c5438958f09fff877e259dc9c11c819b5257b
+          ref: bacd386ff5eb54c6660bea497bb166b684af2aa1
           persist-credentials: false
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
