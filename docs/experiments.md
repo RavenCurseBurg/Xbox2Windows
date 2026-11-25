@@ -5090,6 +5090,14 @@ ctest --preset dev --no-tests=error -R '^compute_(store_aot_descriptor_load_form
 python3 -B tests/compute_load_format_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Heap-view UINT4 buffer stores
+
+The gfx1013 compute fixture translates one indexed `buffer_store_format_xyzw` that writes four raw 32-bit components to a fixed u0. `--heap-store-view SLOT_WORD TABLE_OFFSET COUNT TABLE_BUFFER_BYTES OUTPUT_BYTES` selects a 32-byte record in the [t0 view table](#heap-view-buffer-loads) using a word already loaded from b0. The caller supplies the table extent and writable u0 extent separately. The D3D12 root UAV used by the fixture carries a GPU address with no size limit. [Direct3D 12 root signatures](https://learn.microsoft.com/en-us/windows/win32/direct3d12/root-signatures-overview)
+
+The view must be live and describe format 75 (`BUF_FMT_32_32_32_32_UINT`) with identity channel selectors. The store uses the view base, stride, dispatch thread index and instruction byte offset. Only a complete aligned texel within the record count, stride and declared u0 extent is written. The fixture models view selection within one bound buffer. [LLVM format table](https://releases.llvm.org/15.0.0/docs/AMDGPUModifierSyntax.html#ufmt) · [AMD RDNA 2 shader ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_store_warp)$' --output-on-failure`. The fixture checks all 320 readback words across twelve cases. These include distinct live ranges, one texel ending exactly at the u0 limit, and a partial texel that must leave the sentinel intact. Seven mutations exercise the base, stride, record count, format, lifetime, output extent and slot limit.
+
 ### Heap-view buffer loads
 
 The gfx1013 compute store profile can now take the t0 V# of a `buffer_load_format_x/xy/xyz/xyzw` from a run-time view record instead of a static descriptor. `--heap-view SLOT_WORD TABLE_OFFSET COUNT BUFFER_BYTES` selects it. It is slice 2 of item A of #2022 and builds on the format decoder of [descriptor-format buffer loads](#descriptor-format-buffer-loads). It excludes `--load-format-constant`: the format now comes from the record.

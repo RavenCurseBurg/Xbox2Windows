@@ -646,12 +646,31 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
     )
 
 
+def heap_store_view_hlsl(table_offset, view_count, output_bytes):
+    """Store four UINT words through a live side-table record for the fixed raw u0 binding."""
+    return f"""void store_heap_uint4(uint slot, uint index, uint offset, uint4 value) {{
+    if (slot >= {view_count}u) return;
+    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;
+    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return;
+    uint4 view = inputData.Load4(record);
+    if (view.w != {descriptor_format_word(75):#x}u || (view.y & 0xc000ffffu) != 0u) return;
+    uint stride = view.y >> 16u;
+    if (((view.x | stride) & 3u) != 0u || stride < offset + 16u || index >= view.z) return;
+    const uint bytes = {output_bytes}u;
+    if (view.x > bytes || offset + 16u > bytes - view.x) return;
+    if (index > (bytes - view.x - offset - 16u) / stride) return;
+    outputData.Store4(view.x + index * stride + offset, value);
+}}
+"""
+
+
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
-          descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None):
+          descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None,
+          heap_store_view=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -670,6 +689,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     word index per formatted load, in program order, read by load_descriptor_format (see descriptor_load_hlsl).
     heap_view=(slot_word, table_offset, view_count, buffer_bytes) makes the same loads take the V# from a run-time view record
     instead of a constant format word (see heap_view_hlsl). It excludes load_format_constant.
+    heap_store_view uses the same t0 record layout for one indexed four-component UINT store to u0.
+    Its fifth argument is the writable byte extent of u0. Root UAV descriptors carry no length.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     A full-mask 2D D16 image_store requires an RGBA16 FLOAT UAV.
@@ -797,13 +818,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                        or index not in range(CONSTANT_WORDS) for index in load_format_words)):
             raise ValueError("Invalid buffer load format constant")
     heap_slot_word = heap_table = heap_count = None
-    if heap_view is not None:
+    view_binding = heap_view
+    if heap_store_view is not None:
+        if (heap_view is not None or format_words is not None or stride is not None or output_format is not None
+                or image_output or not isinstance(heap_store_view, (tuple, list)) or len(heap_store_view) != 5):
+            raise ValueError("Invalid heap store view binding")
+        view_binding, output_bytes = heap_store_view[:4], heap_store_view[4]
+        if not isinstance(output_bytes, int) or not 4 <= output_bytes < 1 << 32 or output_bytes % 4:
+            raise ValueError("Invalid heap store view output size")
+    if view_binding is not None:
         if (load_format_words is not None or cpu != "gfx1013" or constant_descriptor is None
                 or source_descriptor is None or source_stride is not None or source_format is not None
-                or not isinstance(heap_view, (tuple, list)) or len(heap_view) != 4
-                or any(not isinstance(v, int) or isinstance(v, bool) for v in heap_view)):
+                or not isinstance(view_binding, (tuple, list)) or len(view_binding) != 4
+                or any(not isinstance(v, int) or isinstance(v, bool) for v in view_binding)):
             raise ValueError("Invalid heap view binding")
-        heap_slot_word, heap_table, heap_count, heap_bytes = heap_view
+        heap_slot_word, heap_table, heap_count, heap_bytes = view_binding
         if (heap_slot_word not in range(CONSTANT_WORDS) or heap_table % 4 or not 0 <= heap_table < 1 << 20
                 or not 1 <= heap_count <= HEAP_VIEW_MAX or heap_bytes % 4
                 or not heap_table + HEAP_VIEW_RECORD_BYTES * heap_count <= heap_bytes < 1 << 30):
@@ -2425,7 +2454,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if formatted:
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
-                if format_words is not None:
+                if heap_store_view is not None:
+                    if channels != "xyzw":
+                        raise ValueError("Heap store view requires buffer_store_format_xyzw")
+                    if not any(tag == ("constant_word", heap_slot_word) and reg not in pending
+                               for reg, tag in scalar.items()):
+                        raise ValueError("Heap store view slot constant is not ready")
+                elif format_words is not None:
                     if format_store_index >= len(format_words):
                         raise ValueError("Formatted buffer store is missing a format constant")
                     format_index = format_words[format_store_index]
@@ -2470,7 +2505,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
-            if addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
+            if heap_store_view is not None:
+                if not formatted or len(tags) != 1 or not isinstance(tags[0], tuple) or tags[0][0] != "thread":
+                    raise ValueError("Heap store view needs a formatted store indexed by dispatch thread ID")
+                axis = tags[0][1]
+                store_layout, covered = ("heap_index", axis), {axis}
+                address = f"tid.{AXES[axis]}"
+            elif addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
                 store_layout = ("fixed",)
                 covered = set()
             elif (stride is not None and idxen and not offen and len(addr_regs) == 1
@@ -2544,7 +2585,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"
                 words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
-            if descriptor_store:
+            if heap_store_view is not None:
+                slot = hlsl_word(("constant_word", heap_slot_word))
+                stores.append(f"    store_heap_uint4({slot}, {address}, {offset}u, uint4({', '.join(words)}));")
+            elif descriptor_store:
                 supplied = words + ["0u"] * (4 - len(words))
                 stores.append("    store_descriptor_format("
                               f"{hlsl_word(('constant_word', format_index))}, {address}, {components}u, "
@@ -2563,6 +2607,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unused buffer load format constant")
     if heap_view is not None and not format_load_index:
         raise ValueError("Unused heap view binding")
+    if heap_store_view is not None and (not layout or layout[0] != "heap_index" or len(stores) != 1):
+        raise ValueError("Heap store view requires exactly one formatted UAV store")
     if load_format_words is not None or heap_view is not None:
         # Every load is staged before the stores. The format words are uniform constants, so an invalid
         # format leaves the whole dispatch unwritten rather than publishing a placeholder result.
@@ -2612,6 +2658,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         descriptor_hlsl += descriptor_load_hlsl()
     if heap_view is not None:
         descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
+    if heap_store_view is not None:
+        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes)
     return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
             f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
@@ -2652,6 +2700,9 @@ def main():
                         metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "BUFFER_BYTES"),
                         help="gfx1013 formatted loads take the V# from the run-time view record at the slot in b0 word "
                              "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
+    parser.add_argument("--heap-store-view", nargs=5, type=lambda n: int(n, 0),
+                        metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "TABLE_BUFFER_BYTES", "OUTPUT_BYTES"),
+                        help="select a UINT4 store view from the t0 table and bound writes by OUTPUT_BYTES of u0")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
@@ -2693,7 +2744,7 @@ def main():
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
                    descriptor_format_constant=args.descriptor_format_constant,
                    rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant,
-                   heap_view=tuple(args.heap_view) if args.heap_view else None)
+                   heap_view=tuple(args.heap_view) if args.heap_view else None, heap_store_view=args.heap_store_view)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
