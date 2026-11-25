@@ -26,7 +26,7 @@ jobs:
           cmake --build out/raster --target startup_stream_rasterizer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory -Force out/raster-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_rasterizer.exe') {
+          foreach ($name in 'd3d12_xs.dll','startup_stream_rasterizer.exe') {
             $bins = @(Get-ChildItem out/raster -File -Recurse -Filter $name)
             if ($bins.Count -ne 1) { throw "Expected a single $name" }
             Copy-Item -LiteralPath $bins[0].FullName -Destination $stage
