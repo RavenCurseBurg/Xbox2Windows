@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 03c8d10c5d2fe9c94f5687b302ff2ca8a81798f2
+          ref: c0cd0bfe10823a070c8f42a6cfe6118b92c1493c
           fetch-depth: 0
           persist-credentials: false
       - name: Build the Release renderer at the experiment commit
@@ -43,17 +43,17 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^(offscreen_capability_table_self_test|compute_store_aot_(descriptor_load_format|mimg_msaa)_warp|pixel_batch_(debug|removal|pairs)_warp)$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^(offscreen_capability_table_self_test|(compute_root|compute_tables|bvh_root_roundtrip|compute_store_aot_(descriptor_load_format|mimg_(msaa|load|store))|pixel_batch_(debug|removal|pairs))_warp)$' 2>&1
           $rc=$LASTEXITCODE
           $rows | Set-Content out/compute-cases.log
           $rows | Select-Object -Last 17
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 6')) {throw "Case controls failed or skipped ($rc)"}
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 11')) {throw "Case controls failed or skipped ($rc)"}
       - name: Time alternating original and shared-program fixture runs
         shell: pwsh
         run: |
           ./tools/dev.ps1
           $base = '2a14c0d7cb38d2e6653515d16e386241453e62c1'
-          $candidate = '03c8d10c5d2fe9c94f5687b302ff2ca8a81798f2'
+          $candidate = 'c0cd0bfe10823a070c8f42a6cfe6118b92c1493c'
           foreach ($revision in $base,$candidate,$candidate,$base,$base,$candidate) {
             git restore --source=$revision -- tests/compute_load_format_check.py
             if ($LASTEXITCODE) {exit $LASTEXITCODE}
@@ -62,6 +62,9 @@ jobs:
             "timing source=$revision" | Tee-Object -Append -FilePath out/compute-cases.log
             $rows | Tee-Object -Append -FilePath out/compute-cases.log | Select-Object -Last 9
             if ($rc -or -not ($rows -match '7 dispatches, 14 wrong references and 11 mutated sources checked')) {throw "Incomplete fixture ($rc)"}
+            if ($revision -eq $candidate) {
+              if (@($rows -match 'case=\d+ status=pass$').Count -ne 7 -or @($rows -match 'case=\d+ status=mismatch$').Count -ne 14) {throw 'Missing reference statuses'}
+            }
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
