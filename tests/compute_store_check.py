@@ -8517,10 +8517,19 @@ def find_llvm15():
         for name in ("LLVM-C.dll", "libLLVM-15.so.1", "libLLVM.so"):
             if (parent / name).exists():
                 return ("mc", mc, objcopy, str(parent / name))
-    windows = Path(r"C:\Program Files\LLVM\bin")
-    clang, objcopy_path, library = windows / "clang.exe", windows / "llvm-objcopy.exe", windows / "LLVM-C.dll"
-    if clang.exists() and objcopy_path.exists() and library.exists():
-        return ("clang", str(clang), str(objcopy_path), str(library))
+    if os.name == "nt":
+        # The Windows LLVM 15 package ships clang's integrated assembler instead of llvm-mc.
+        for directory in [*os.get_exec_path(), r"C:\Program Files\LLVM\bin"]:
+            windows = Path(directory)
+            clang, objcopy_path, library = (windows / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            if not (windows.is_absolute() and clang.is_file() and objcopy_path.is_file() and library.is_file()):
+                continue
+            try:
+                version = subprocess.run([clang, "--version"], capture_output=True)
+            except OSError:
+                continue
+            if version.returncode == 0 and re.search(rb"\bclang version 15\.", version.stdout):
+                return ("clang", str(clang), str(objcopy_path), str(library))
     return None
 
 
@@ -8717,6 +8726,16 @@ def descriptor_shader_bytes(source, thread_id):
 
 
 def descriptor_store_controls():
+    if os.name == "nt":
+        # A complete toolchain on PATH must enable the optional round trip outside Program Files too.
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = tuple(Path(tmp) / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            for tool in tools:
+                tool.touch()
+            version = subprocess.CompletedProcess([], 0, b"clang version 15.0.7\n")
+            with (patch.object(shutil, "which", return_value=None), patch.object(os, "get_exec_path", return_value=[tmp]),
+                  patch.object(subprocess, "run", return_value=version)):
+                assert find_llvm15() == ("clang", *map(str, tools))
     assert descriptor_unorm_bits(F25, 255) == 64
     assert descriptor_unorm_bits(F75, 255) == 191
     assert descriptor_unorm_bits(F25, 1023) == 256

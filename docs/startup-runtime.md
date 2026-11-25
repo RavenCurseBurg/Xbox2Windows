@@ -958,7 +958,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
-| `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
+| `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
@@ -1686,7 +1686,10 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
   state. `CB_TARGET_MASK` is not located, so all four channels are written unless the translated
   export leaves some unwritten (manifest `wmask`, above). A word the decoder refuses for any of the eight targets leaves the
-  registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
+  registers unused (a blending target other than 0 with a `SRC1_*` dual-source factor, or any
+  blending target other than 0 alongside a dual-source target 0, is refused too, since only
+  target 0 has a second shader output): the pipeline keeps the path it had before and the refusal
+  is logged. No target
   is drawn unblended in place of a refused word
   (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
   `tests/startup_slot57_blend_draw_check.py` draws through a source-built slot 57 pipeline: red
@@ -2097,6 +2100,86 @@ memory-type and state rules are unchanged. The five-second `x2w-d3d12 views note
   cases and nowhere else; `_walk_only_control` never uses the region information and passes only when
   that call count is its sole failure. Neither is `WILL_FAIL`, so a crash cannot pass them. A
   refused allocation or mapping is a capability skip (77) in the controls.
+
+## Command-list upload allocation (slot 148)
+
+In render mode, slot 148 takes a byte count and a power-of-two alignment and returns CPU-writable D3D12 upload memory for the current recording. An invalid request or a closed list returns null. Compute and graphics root SRV slots 43 and 44 translate an aligned address within the current recording into its desktop GPU address. The desktop command allocator retains the pages until every recorded reference and tracked queue submission has retired and the allocator can be reset. A failed submission-fence signal prevents reuse.
+
+The fixture export `x2w_d3d12_upload_gpu_address(list, cpu, bytes)` reports the GPU address only for a nonempty range contained in one allocation of the open recording. The independent client and its four WARP and hardware configurations are described in [#2210](https://github.com/R0Y00/Xbox2Windows/pull/2210).
+
+## Textures published by address (device slot 70)
+
+Device slot 70 gets a resource description, a view and the address of the texels. When a live
+texture with that description exists at the address, its view is created as before. The shapes slot
+70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
+BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
+with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
+draw that samples the view copies each mip of each array slice from that layout into desktop
+footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
+after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
+
+The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
+the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
+textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+at most 64 MiB.
+
+A console-layout description is held (not published, descriptor unchanged) in the two cases a
+partial-tile BC view is held for. `console_layout_xg_rows`: the latest XG stand-in copy announced
+for the address wrote desktop-footprint rows, so the bytes are not in the layout the description
+names. As for a partial-tile view, a texture already published there samples the null view while
+that is so. `console_layout_beyond_xg_size`: the layout runs past the size the XG stand-in reports
+for the description (the desktop copyable footprints of a slice rounded up to 64 KiB, times the
+slices), which the title may not own.
+
+Upload lifetime: each upload of a console-layout texture is written into an upload buffer of its own
+(`x2w_upload::make_page`), not into the shared upload ring. The recording keeps a reference to the
+buffer and to the texture until the list is reset, and each `ExecuteCommandLists` of the recording
+takes its own references and signals a fence behind the submit; a later submit drops the references
+of the submits whose fence has completed. A submit whose fence cannot be created or signalled keeps
+its references. The earlier by-address shapes keep using the shared ring as before. The desktop
+texture of a by-address texture is made on the first draw that samples it and is not released. The
+texels are compared with the uploaded copy on each frame that binds them, as for the earlier
+by-address shapes, and at once after a repeated slot 70 call for the same texture, which announces
+a write: a description and address that were published before are published again rather than
+taken as a live resource, so changed texels are uploaded again.
+
+Limits and choices that are not measured against a console:
+
+- The texels are taken in the layout the description names. The XG stand-in's default copy writes
+  rows whatever the swizzle mode; a description filled through it is held as above. A write by the
+  title itself is not told apart from one in the named layout.
+- One upload buffer is created per upload and there is no bound on the bytes uploaded in a frame.
+  A policy for releasing textures that are no longer sampled and for spreading large uploads over
+  frames is left to a follow-up.
+- Second sources for the address equations: only the 16-byte standard rows of `0x105` and `0x109`
+  are compared with another implementation in the tree (`bc7_4k_s.h`, `bc64_chain.h`);
+  `tile64_plan.h` checks the `0x10a` mip starts and tail, not the bit order. The display (`_D`)
+  rows in `gfx10_layout.h` that differ from the standard ones (1-, 8- and 16-byte elements; the 2-
+  and 4-byte display rows equal the standard rows) and the standard rows for 1-, 2-, 4- and 8-byte
+  elements are checked only against the addrlib pattern rows restated from the addrlib source text
+  in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
+  `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
+
+Log lines (stderr and `X2W_TRAP_LOG`):
+
+- `x2w-d3d12 slot70 texture kind <n>: <outcome>; first seen res{...} view{...} address=...`, once
+  for each new combination of format, layout, one or several mips, one or several slices, flags,
+  dimension, view format, view dimension and outcome (at most 200). The outcome is
+  `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
+  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+- `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
+  submits that drop retained uploads.
+
+Checks (reproduction in `docs/experiments.md`, "Sample by-address textures of the non-XOR console
+layouts"):
+
+- `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
+- `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
 
 ## Buffer memory SRVs (device slot 70)
 

@@ -28,7 +28,6 @@ static_assert(not_implemented == E_NOTIMPL);
 struct XAsyncBlock;
 struct XUserHandleStorage;
 using XUserHandle = XUserHandleStorage*;
-enum class XUserAddOptions : std::uint32_t { None = 0 };
 
 struct ExpectedThunk {
     const char* name;
@@ -36,8 +35,7 @@ struct ExpectedThunk {
     const char* function;
 };
 
-constexpr std::array<ExpectedThunk, 2> expected_thunks{{
-    {"XUserAddAsync", "XUser", "XUserAddAsync"},
+constexpr std::array<ExpectedThunk, 1> expected_thunks{{
     {"XPackageMountWithUiAsync", "XPackage", "XPackageMountWithUiAsync"},
 }};
 
@@ -54,7 +52,6 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, result) == 4);
 static_assert(offsetof(XGameRuntimeShimLogEntry, component) == 8);
 static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
 
-using UserAddAsync = HRESULT(WINAPI*)(XUserAddOptions, XAsyncBlock*);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
@@ -161,11 +158,9 @@ bool find_proc(HMODULE module, const char* name, Proc& proc)
 
 bool calls_return_not_implemented(HMODULE module)
 {
-    UserAddAsync user_add = nullptr;
     PackageMountWithUiAsync package_mount = nullptr;
 
-    if (!find_proc(module, expected_thunks[0].name, user_add) ||
-        !find_proc(module, expected_thunks[1].name, package_mount)) {
+    if (!find_proc(module, expected_thunks[0].name, package_mount)) {
         return false;
     }
 
@@ -173,9 +168,8 @@ bool calls_return_not_implemented(HMODULE module)
         const char* name;
         HRESULT result;
     };
-    const std::array<Call, 2> calls{{
-        {expected_thunks[0].name, user_add(XUserAddOptions::None, nullptr)},
-        {expected_thunks[1].name, package_mount(nullptr, nullptr)},
+    const std::array<Call, 1> calls{{
+        {expected_thunks[0].name, package_mount(nullptr, nullptr)},
     }};
     for (const auto& call : calls) {
         if (call.result != not_implemented) {

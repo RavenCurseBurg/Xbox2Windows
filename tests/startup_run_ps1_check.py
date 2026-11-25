@@ -86,7 +86,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
     """
-    root = Path(tempfile.mkdtemp(dir=work))
+    root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
@@ -100,6 +100,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     exe.write_bytes(b"")
     data.mkdir()
     env = dict(os.environ)
+    # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
+    env["NO_COLOR"] = "1"
     env.pop("X2W_FAKE_USER", None)
     if fake_user_env:
         env["X2W_FAKE_USER"] = "1"

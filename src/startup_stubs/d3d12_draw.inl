@@ -765,6 +765,125 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
     submitted_draw_sampler_heaps.push_back(std::move(batch));
 }
 
+struct TextureUpload {
+    u64 hash = 0, generation = ~0ull;
+    LONG checked_frame = -1000;
+    bool done = false, tiled = false;
+    ID3D12CommandList* pending_list = nullptr;
+    u64 revision = 0;
+};
+std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
+u64 address_upload_revision;
+
+// A texture published in a newly supported console layout is not filled through the shared upload ring.
+// The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
+// recorded copy long after later uploads have passed over its source bytes. Each such upload owns
+// its upload buffer instead. The buffer and the texture it fills stay referenced by the recording,
+// and by every submit of that recording until the queue it went to has completed the submit, as
+// for the sampler heaps above.
+struct AddressUpload {
+    x2w_startup::ComPtr<ID3D12Resource> buffer, texture;
+    u64 revision;
+    bool pinned = false;
+};
+std::unordered_map<ID3D12CommandList*, std::vector<AddressUpload>> recorded_address_uploads;
+struct SubmittedAddressUploads {
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    std::vector<AddressUpload> uploads;
+};
+std::vector<SubmittedAddressUploads> submitted_address_uploads;
+
+// X2W_TEST_ADDRESS_UPLOAD_RING=1 (fixtures only): fill by-address textures from the shared upload ring,
+// without the buffers above. The control of startup_address_console_gate runs with it.
+bool address_uploads_from_ring()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0) != 0;
+    return on;
+}
+
+void discard_address_uploads(ID3D12CommandList* list)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    const auto recorded = recorded_address_uploads.find(list);
+    if (recorded != recorded_address_uploads.end()) {
+        for (const auto& upload : recorded->second) {
+            const auto state = texture_uploads().find(upload.texture.Get());
+            if (state != texture_uploads().end() && state->second.pending_list == list) {
+                state->second.done = false;
+                state->second.pending_list = nullptr;
+            }
+        }
+        recorded_address_uploads.erase(recorded);
+    }
+    ReleaseSRWLockExclusive(&draw_lock);
+}
+
+// draw_lock held. The lists have already been executed on this queue. Each submit takes its own
+// references; they are dropped by a later call, once the fence signalled behind the submit has
+// completed. A submit whose fence could not be made or signalled keeps its references.
+void retire_address_uploads(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
+{
+    static std::size_t peak, released;
+    const std::size_t before = submitted_address_uploads.size();
+    submitted_address_uploads.erase(std::remove_if(submitted_address_uploads.begin(),
+        submitted_address_uploads.end(), [](const SubmittedAddressUploads& batch) {
+            return batch.fence && batch.fence->GetCompletedValue() != 0;
+        }), submitted_address_uploads.end());
+    if (const std::size_t gone = before - submitted_address_uploads.size()) {
+        released += gone;
+        static LONG reports;
+        if (first_calls(reports, 12))
+            log("x2w-draw by-address uploads: %zu submits completed and released (%zu so far, %zu still pending, at most %zu pending)",
+                gone, released, submitted_address_uploads.size(), peak);
+    }
+    for (auto* list : lists) {
+        const auto it = recorded_address_uploads.find(list);
+        if (it == recorded_address_uploads.end()) continue;
+        for (const auto& upload : it->second) {
+            const auto state = texture_uploads().find(upload.texture.Get());
+            if (state == texture_uploads().end()) continue;
+            // A recording that writes an older revision may be submitted again. When the
+            // last write in a batch differs from the cache, make the next draw restage it.
+            auto& cached = state->second;
+            cached.done = cached.revision == upload.revision;
+            if (cached.pending_list == list) cached.pending_list = nullptr;
+        }
+    }
+    try {
+        SubmittedAddressUploads batch;
+        for (auto* list : lists) {
+            const auto it = recorded_address_uploads.find(list);
+            if (it == recorded_address_uploads.end()) continue;
+            for (const auto& upload : it->second)
+                if (!upload.pinned) batch.uploads.push_back(upload);
+        }
+        if (batch.uploads.empty()) return;
+        x2w_startup::ComPtr<ID3D12Device> device;
+        HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+        if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
+        if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
+        if (FAILED(hr)) {
+            batch.fence.Reset();
+            log("x2w-draw by-address upload retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
+        }
+        submitted_address_uploads.push_back(std::move(batch));
+        peak = (std::max)(peak, submitted_address_uploads.size());
+    } catch (const std::bad_alloc&) {
+        // Execution already happened. Pin each affected resource once if bookkeeping fails.
+        for (auto* list : lists) {
+            const auto it = recorded_address_uploads.find(list);
+            if (it == recorded_address_uploads.end()) continue;
+            for (auto& upload : it->second) {
+                if (upload.pinned) continue;
+                upload.buffer->AddRef();
+                upload.texture->AddRef();
+                upload.pinned = true;
+            }
+        }
+        log("x2w-draw by-address upload retirement storage exhausted; uploads pinned");
+    }
+}
+
 bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler)
 {
     if (words[0] != view_token_magic) {
@@ -872,12 +991,6 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
 // Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
-struct TextureUpload {
-    u64 hash = 0, generation = ~0ull;
-    LONG checked_frame = -1000;
-    bool done = false, tiled = false;
-};
-std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
 {
@@ -888,11 +1001,15 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     for (std::size_t i = words * 8; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
     return h;
 }
-void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
+bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    const auto* original = resource_info(resource);
+    const bool tiled_address = resource->own().tiled_address_srv;
+    const bool console = tiled_address && original && console_layout_srv(original->console);
+    const bool dedicated = console && !address_uploads_from_ring();
     // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
     const bool single = resource->own().tiled_address_srv && x2w_startup::single_element_bytes(desc) != 0;
     const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || single ||
@@ -906,27 +1023,35 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 desc.Width, desc.Height, desc.Format, desc.Flags, desc.Dimension, static_cast<const void*>(memory));
         }
     }
-    if (!memory || !list) return;
-    if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return;
-    if (!uploadable) return;
+    if (!memory || !list || !uploadable) return !console;
+    if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return !console;
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
     const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
-    if (mips > 15) return;
+    if (mips > 15) return !console;
     const x2w_startup::SliceFootprints plan(device_of(the_device), desc, mips);
     const UINT64 slice_total = plan.size;
-    if (slice_total == ~0ull || !slice_total) return;
+    if (slice_total == ~0ull || !slice_total) return !console;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
-    TextureUpload& state = texture_uploads()[texture];
+    TextureUpload* cached;
+    try {
+        cached = &texture_uploads()[texture];
+    } catch (const std::bad_alloc&) {
+        if (!console) throw;
+        return false;
+    }
+    TextureUpload& state = *cached;
     TextureWrite written;
     AcquireSRWLockShared(&written_lock);
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
         written = found->second;
     ReleaseSRWLockShared(&written_lock);
-    const auto* original = resource_info(resource);
     const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
-    const bool tiled_address = resource->own().tiled_address_srv;
+    // Any other texture slot 70 publishes holds its texels in the console layout its description names
+    // (gfx10_layout.h, address_texture.h).
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
     const bool tiled = tiled_bc7 || tiled_address || tiled_chain;
+    std::optional<x2w_startup::gfx10::Layout> console_layout;
+    if (console) console_layout.emplace(original->console);
     const auto generation = written.generation;
     const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
                                          tiled_bc7 ? written.bc7_height : desc.Height);
@@ -934,31 +1059,81 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
             original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
-            desc.Height != surface.rows * surface.block_texels) return;
+            desc.Height != surface.rows * surface.block_texels) return true;
     }
-    if (tiled && !tiled_chain && !single && (plan.count != 1 || plan.rows[0] != surface.rows ||
-                  plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
+    if (tiled && !tiled_chain && !single && !console && (plan.count != 1 || plan.rows[0] != surface.rows ||
+                  plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return true;
+    if (console) {
+        // The desktop footprints must hold exactly the elements the console layout addresses.
+        if (console_layout->mips != mips || console_layout->slices != slices || plan.count != mips) return false;
+        for (UINT i = 0; i < mips; ++i)
+            if (!plan.bytes(i) || plan.rows[i] != console_layout->rows(i) ||
+                plan.row_bytes[i] != u64{console_layout->columns(i)} * console_layout->bytes_per_element) return false;
+    }
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->bytes()
+        : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
     const bool recheck = single || ((tiled_address || tiled_chain) ? elapsed != 0
         : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
-    if (state.done && !announced && !recheck) return;
+    const bool reusable = state.done && (!state.pending_list || state.pending_list == list);
+    if (reusable && !announced && !recheck) return true;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
+        if (console) return false;
         state.done = true;
         state.generation = generation;
-        return;
+        return true;
     }
-    state.checked_frame = frame_number;
+    if (!console) state.checked_frame = frame_number;
     const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
-    if (state.done && hash == state.hash && state.tiled == tiled) {
+    if (reusable && hash == state.hash && state.tiled == tiled) {
+        state.checked_frame = frame_number;
         state.generation = generation;
-        return;
+        return true;
+    }
+    constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    x2w_upload::Page owned;
+    if (dedicated) {
+        u64 bytes = 0;
+        for (UINT i = 0; i < mips; ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        bytes *= slices;
+        if (FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) return false;
+        // Store the owning reference before issuing any D3D12 commands that name the buffer.
+        try {
+            recorded_address_uploads[list].push_back({owned.resource, texture, ++address_upload_revision});
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (tiled_chain) {
+    if (console) {
+        for (UINT slice = 0; slice < slices; ++slice) {
+            for (UINT i = 0; i < mips; ++i) {
+                const u64 bytes = plan.bytes(i);
+                u64 offset = owned.cursor;
+                unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+                if (owned.cpu) {
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                } else {
+                    rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+                    if (!rows) {
+                        state.done = false;
+                        return false;
+                    }
+                    std::memset(rows, 0, static_cast<std::size_t>(bytes));
+                }
+                console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : upload_ring, mips, slices, slice, i, offset);
+            }
+        }
+        if (dedicated) {
+            state.pending_list = list;
+            state.revision = address_upload_revision;
+        }
+    } else if (tiled_chain) {
         const x2w_startup::bc64::Chain chain(original->console);
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
@@ -967,7 +1142,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
                 if (!rows) {
                     state.done = false;
-                    return;
+                    return true;
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
@@ -980,7 +1155,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
         if (!rows) {
             state.done = false;
-            return;
+            return true;
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
@@ -993,13 +1168,14 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 u64 offset = 0;
                 if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
                     state.done = false;
-                    return;
+                    return true;
                 }
                 plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
             }
     }
     state.hash = hash;
     state.generation = generation;
+    state.checked_frame = frame_number;
     state.tiled = tiled;
     state.done = true;
     InterlockedIncrement(&textures_uploaded);
@@ -1008,6 +1184,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (first_calls(shown, 12))
         log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s", static_cast<void*>(texture), desc.Width,
             desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "");
+    return true;
 }
 
 // Per-draw dumps (X2W_DRAW_DUMP_FRAME=<frame>, X2W_DRAW_DUMP_DIR=<folder>): during that frame, render
@@ -1273,7 +1450,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 }
             }
-            if (texture) upload_texture(self, resource, texture);
+            if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) require_state(self, texture, sampled_state(self, texture));
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
