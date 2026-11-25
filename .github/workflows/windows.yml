@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: c0cd0bfe10823a070c8f42a6cfe6118b92c1493c
+          ref: 76dd27e11ed85e29daaadabb3bdcf5216adf0478
           fetch-depth: 0
           persist-credentials: false
       - name: Build the Release renderer at the experiment commit
@@ -30,7 +30,7 @@ jobs:
           $stage = New-Item -ItemType Directory -Force out/compute-batch
           Copy-Item out/build/release/offscreen_check.exe,out/build/release/CTestTestfile.cmake -Destination $stage
           if (Test-Path out/build/release/D3D12) {Copy-Item out/build/release/D3D12 -Recurse -Destination $stage}
-          ctest --preset release --show-only=json-v1 -R '^(offscreen_capability_table_self_test|compute_store_aot_descriptor_load_format_|pixel_batch_)' | Set-Content "$stage/ctest.json"
+          ctest --preset release --show-only=json-v1 -R '^compute_(heap_view_controls|store_aot_(descriptor_load_format|heap_view_(load|store))_warp)$' | Set-Content "$stage/ctest.json"
           if ($LASTEXITCODE) {exit $LASTEXITCODE}
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -Recurse -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
@@ -39,31 +39,32 @@ jobs:
           name: compute-batch-renderer
           path: out/compute-batch
           retention-days: 2
-      - name: Run the descriptor and pixel error controls
+      - name: Run both batch users and their heap controls
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^(offscreen_capability_table_self_test|(compute_root|compute_tables|bvh_root_roundtrip|compute_store_aot_(descriptor_load_format|mimg_(msaa|load|store))|pixel_batch_(debug|removal|pairs))_warp)$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^compute_(heap_view_controls|store_aot_(descriptor_load_format|heap_view_(load|store))_warp)$' 2>&1
           $rc=$LASTEXITCODE
           $rows | Set-Content out/compute-cases.log
           $rows | Select-Object -Last 17
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 11')) {throw "Case controls failed or skipped ($rc)"}
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 4')) {throw "Case controls failed or skipped ($rc)"}
       - name: Time alternating original and shared-program fixture runs
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $base = '2a14c0d7cb38d2e6653515d16e386241453e62c1'
-          $candidate = 'c0cd0bfe10823a070c8f42a6cfe6118b92c1493c'
+          $base = '0236873794ac49a0154a623fdbaa3c0b46fc7035'
+          $candidate = '76dd27e11ed85e29daaadabb3bdcf5216adf0478'
           foreach ($revision in $base,$candidate,$candidate,$base,$base,$candidate) {
-            git restore --source=$revision -- tests/compute_load_format_check.py
+            git restore --source=$revision -- tests/compute_load_format_check.py tests/compute_heap_view_check.py
             if ($LASTEXITCODE) {exit $LASTEXITCODE}
-            $rows = ctest --preset release --no-tests=error -V -R '^compute_store_aot_descriptor_load_format_warp$' 2>&1
+            $rows = ctest --preset release --no-tests=error -V -R '^compute_store_aot_heap_view_load_warp$' 2>&1
             $rc = $LASTEXITCODE
             "timing source=$revision" | Tee-Object -Append -FilePath out/compute-cases.log
             $rows | Tee-Object -Append -FilePath out/compute-cases.log | Select-Object -Last 9
-            if ($rc -or -not ($rows -match '7 dispatches, 14 wrong references and 11 mutated sources checked')) {throw "Incomplete fixture ($rc)"}
+            $wrong = if ($revision -eq $candidate) {7} else {6}
+            if ($rc -or -not ($rows -match "56 dispatches, $wrong wrong references and 14 mutated sources checked")) {throw "Incomplete fixture ($rc)"}
             if ($revision -eq $candidate) {
-              if (@($rows -match 'case=\d+ status=pass$').Count -ne 7 -or @($rows -match 'case=\d+ status=mismatch$').Count -ne 14) {throw 'Missing reference statuses'}
+              if (@($rows -match 'case=\d+ status=pass$').Count -ne 56 -or @($rows -match 'case=\d+ status=mismatch$').Count -ne 7) {throw 'Missing reference statuses'}
             }
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
