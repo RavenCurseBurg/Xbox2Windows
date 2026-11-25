@@ -1,0 +1,43 @@
+name: Build the pixel fixture for physical adapter timing
+on:
+  push:
+    branches: ['measure/448-intel-split']
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 82bb67ef70221f5c2d9a714f1ce379903258793a
+          persist-credentials: false
+      - name: Build the Debug renderer and export the generated CTest registrations
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --preset dev -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebug
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset dev --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stage = New-Item -ItemType Directory out/pixel-timing
+          $build = 'out/build/dev'
+          Copy-Item "$build/offscreen_check.exe","$build/CTestTestfile.cmake" -Destination $stage
+          ctest --preset dev --show-only=json-v1 -R '^pixel_aot_(hardware|core_vector_hardware|comparisons_hardware|predicate_rounding_hardware)$' | Set-Content "$stage/hardware.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $entries = (Get-Content -Raw "$stage/hardware.json" | ConvertFrom-Json).tests
+          if ($entries.Count -ne 4) { throw 'Expected four CTests' }
+          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
+          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pixel-timing-dev
+          path: out/pixel-timing/
+          if-no-files-found: error
+          retention-days: 2
