@@ -2517,9 +2517,6 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
-    pass.compute_srv_bound = 0;
-    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
-    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
