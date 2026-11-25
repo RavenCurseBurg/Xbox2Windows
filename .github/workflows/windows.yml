@@ -1,7 +1,7 @@
-name: Verify slot 57 wave64 scalar shift readbacks
+name: Verify compute store device reuse
 on:
   push:
-    branches: ['verify/mesh57-wave-scalar-shift']
+    branches: [verify/compute-store-case-device-reuse]
 permissions:
   contents: read
 jobs:
@@ -12,48 +12,44 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: e9346b1aa5e4506eba532bd91f280ae96e24db2f
+          ref: d041967afdaf8ba3c8c1e5a47b569552bd3d6654
           persist-credentials: false
-      - name: Build the renderer
+      - name: Build the Release renderer at the experiment commit
         shell: pwsh
         run: |
           ./tools/dev.ps1
           python -m venv out/pe-env
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
           cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset release --target offscreen_check startup_indirect_draw_indexed
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = New-Item -ItemType Directory -Force out/mesh57-renderer
-          Copy-Item out/build/release/offscreen_check.exe -Destination $stage
-          Copy-Item out/build/release/startup_indirect_draw_indexed.exe,out/build/release/d3d12_xs.dll -Destination $stage
-          Copy-Item out/build/release/CTestTestfile.cmake -Destination $stage
-          ctest --preset release --show-only=json-v1 -R '^startup_mesh57_skeleton' | Set-Content "$stage/skeleton.json"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          cmake --build --preset release --target offscreen_check
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          $stage = New-Item -ItemType Directory -Force out/compute-batch
+          Copy-Item out/build/release/offscreen_check.exe,out/build/release/CTestTestfile.cmake -Destination $stage
           if (Test-Path out/build/release/D3D12) {Copy-Item out/build/release/D3D12 -Recurse -Destination $stage}
+          ctest --preset release --show-only=json-v1 -R '^(offscreen_capability_table_self_test|compute_store_aot_descriptor_load_format_|pixel_batch_)' | Set-Content "$stage/ctest.json"
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -Recurse -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,([IO.Path]::GetRelativePath($stage.FullName,$_.FullName)) } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mesh57-renderer
-          path: out/mesh57-renderer/
-          if-no-files-found: error
+          name: compute-batch-renderer
+          path: out/compute-batch
           retention-days: 2
-      - name: Run slot 57 host and WARP readbacks
+      - name: Run the descriptor and pixel error controls
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_mesh57_skeleton($|_.*_warp$)' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^(offscreen_capability_table_self_test|compute_store_aot_descriptor_load_format_warp|pixel_batch_(debug|removal|pairs)_warp)$' 2>&1
           $rc=$LASTEXITCODE
-          $rows | Set-Content out/mesh57-shift.log
+          $rows | Set-Content out/compute-cases.log
           $rows | Select-Object -Last 17
-          if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped test ($rc)"}
-          if (-not ($rows -match 'per-lane.cso: 66 pixels differ') -or -not ($rows -match '100% tests passed out of 4')) {throw 'Missing fixture or mutant readback'}
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 5')) {throw "Case controls failed or skipped ($rc)"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: mesh57-log
-          path: out/mesh57-shift.log
+          name: compute-batch-log
+          path: out/compute-cases.log
           retention-days: 2
