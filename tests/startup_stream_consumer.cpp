@@ -354,8 +354,16 @@ int main(int argc, char** argv)
     if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
-    if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0)
-        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? dispatch_slot67(adapter.Get(), device, argv[8]) : 10;
+    if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0) {
+        if (!create_slot67(device, argv[5], argv[6], argv[7], argv[8])) return 10;
+        if (std::strcmp(argv[8], "dispatch-retry") == 0) {
+            if (int rc = dispatch_slot67(adapter.Get(), device, "dispatch")) return rc;
+            std::puts("first slot 67 Dispatch fenced");
+            std::fflush(stdout);
+            if (std::getchar() != '\n') return 2;
+        }
+        return dispatch_slot67(adapter.Get(), device, argv[8]);
+    }
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
