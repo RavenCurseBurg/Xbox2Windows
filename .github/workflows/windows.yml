@@ -53,3 +53,4 @@ jobs:
               if ($rc -ne 1 -or -not ($lines -match 'Clamp 1[.]49609375 read mip 2 translated, mip 1 in the HLSL control')) { throw 'Wrong shader did not fail at the measured edge' }
             } elseif ($rc) { throw "$case exited $rc" }
           }
+          exit 0
