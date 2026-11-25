@@ -1,29 +1,60 @@
-name: Build the compute gather fixture renderer
-
+name: Verify startup compute gathers with the D3D12 debug layer
 on: workflow_dispatch
-
 permissions:
   contents: read
-
 jobs:
-  renderer:
+  gather:
     if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/compute-gather-lz-renderer'
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          repository: R0Y00/Xbox2Windows
-          ref: ed96f4989e9af8abf1afe47074314adbae3a57b2
+          ref: 59a0595939bf0f0e4ceac077dbed856c5684ae09
           persist-credentials: false
-      - name: Build and smoke-test the upstream GPU package
+      - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
-        run: ./tools/package-gpu-check.ps1
+        run: |
+          ./tools/dev.ps1
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $sdk = New-Item -Force -ItemType Directory out/agility
+          $pkg = Join-Path $sdk.FullName 'sdk.nupkg'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg' -OutFile $pkg
+          if ((Get-FileHash -LiteralPath $pkg).Hash -ne '70489669C2BBEAF318B62D72B0AC3E753D521387BFC848C9763791C4E920BFCC') { throw 'SDK hash differs' }
+          $zip = [IO.Compression.ZipFile]::OpenRead($pkg)
+          try {
+            foreach ($name in 'D3D12Core.dll','d3d12SDKLayers.dll') {
+              [IO.Compression.ZipFileExtensions]::ExtractToFile($zip.GetEntry("build/native/bin/x64/$name"),(Join-Path $sdk.FullName $name))
+            }
+          } finally { $zip.Dispose() }
+          cmake --preset dev -B out/gather-check -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DOFFSCREEN_AGILITY_620_DIR=$($sdk.FullName)"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build out/gather-check --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stage = New-Item -Force -ItemType Directory out/gather-artifact
+          Copy-Item -LiteralPath out/gather-check/offscreen_check.exe -Destination $stage
+          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
+          (Get-FileHash -LiteralPath "$stage/offscreen_check.exe").Hash | Set-Content -Encoding ascii "$stage/RENDERER_SHA256.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gpu-check-windows-x64
-          path: |
-            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip
-            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip.sha256
-          if-no-files-found: error
+          name: renderer-source-build
+          path: out/gather-artifact/
           retention-days: 2
+          if-no-files-found: error
+      - name: Run WARP and check the debug layer and mismatch counts
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          out/gather-check/offscreen_check.exe --self-test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $lines = ctest --test-dir out/gather-check --no-tests=error -V -R '^startup_compute_gather_lz(_warp)?$' 2>&1
+          $rc = $LASTEXITCODE
+          $lines | Write-Output
+          if ($rc) { exit $rc }
+          $log = $lines -join [Environment]::NewLine
+          foreach ($required in 'backend=warp debug_layer=enabled','debug_errors=0 debug_warnings=0','startup_compute_gather_lz_warp [ .]+Passed','word=0 expected=3f1020e2 actual=00000000','word=0 expected=3f1020e2 actual=3f1020e0','word=0 expected=3f1020e2 actual=3f0041e2','word=0 expected=3f1020e2 actual=3f1010e2') {
+            if ($log -notmatch $required) { throw "Missing result: $required" }
+          }
