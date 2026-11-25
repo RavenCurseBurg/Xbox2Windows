@@ -1,16 +1,26 @@
 name: Check narrow integer render target exports on Windows
-on: workflow_dispatch
+on:
+  push:
+    branches: ['verify/mrt-narrow-runtime']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   validation:
     if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/mrt-narrow-runtime'
     runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [dev, release]
+    name: 'WARP narrow MRT / ${{ matrix.preset }}'
+    env:
+      PRESET: ${{ matrix.preset }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: b105847c6502cf889f6982d7047ab3236c1ab15d
+          ref: 55f9d550aaf9d2e96b543906014c40a927be2c6e
           persist-credentials: false
       - name: Build the test renderer and run both WARP compilers
         shell: pwsh
@@ -20,11 +30,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --preset $env:PRESET
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer
+          $kind=if ($env:PRESET -eq 'dev') { 'Debug' } else { 'Release' }
+          if (-not (Select-String -Path "out/build/$env:PRESET/CMakeCache.txt" -Pattern "^CMAKE_BUILD_TYPE:STRING=$kind$")) { throw 'Unexpected build preset configuration' }
+          if ((git rev-parse HEAD) -ne '55f9d550aaf9d2e96b543906014c40a927be2c6e') { throw 'Wrong checkout' }
+          cmake --build --preset $env:PRESET --target startup_stream_consumer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $lines = ctest --test-dir out/mrt --no-tests=error -V -R '^(startup_mrt_(fxc|dxc)_warp|startup_gfx2hlsl_export_mask)$' 2>&1
+          $lines = ctest --preset $env:PRESET --no-tests=error -V -R '^(startup_mrt_(fxc|dxc)_warp|startup_gfx2hlsl_export_mask)$' 2>&1
           $rc = $LASTEXITCODE
           $lines | Select-Object -Last 18
           if ($rc -or $lines -match '\*\*\*Skipped|Not Run') { throw "CTest failed or skipped a fixture (exit $rc)" }
