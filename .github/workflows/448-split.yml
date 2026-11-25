@@ -12,11 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 3bc6c3bb9849b1c57c0aef5b062982dd6c9b882f
+          ref: e5484d6c70a711c1a0335d521a8a12b3abab07f6
           persist-credentials: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 3ac087b05bddc78daa16783dfee318e41d841583
+          ref: 5123cc6d0cd9c7730d39e9d989f38dc060a987d1
           path: out/predicate-base
           persist-credentials: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
