@@ -71,9 +71,9 @@ jobs:
             foreach ($row in 'sampler swap 0: sample 0.25 0.75, comparison 0 1','sampler swap 1: sample 0.75 0.25, comparison 0 1','sampler swap 2: sample 0.25 0.75, comparison 1 0') {
               if (@($lines -match [regex]::Escape($row)).Count -lt 2) { throw "Missing translated rows $row" }
             }
-            $required=@('0 tests failed out of 2','dispatch_thread_control=pass group_index_reproduction=matches','sampler swap 1 word 2: expected=00000000 actual=c0400000','sampler swap 1 word 3: expected=3f800000 actual=c0800000')
+            $required=@('2/2 Test','dispatch_thread_control=pass group_index_reproduction=matches','sampler swap 1 word 2: expected=00000000 actual=c0400000','sampler swap 1 word 3: expected=3f800000 actual=c0800000')
           } else {
-            $required=@('0 tests failed out of 1','pixel_mismatch x=0 y=0')
+            $required=@('1/1 Test','pixel_mismatch x=0 y=0')
             foreach ($kind in 'translated','control') {
               foreach ($entry in 'clamp=1.49609375 selected_mip=1','clamp=1.99609375 selected_mip=2','clamp=2 selected_mip=2','negative clamp=1.5625 mip=0') {
                 $required+="$kind $entry"
