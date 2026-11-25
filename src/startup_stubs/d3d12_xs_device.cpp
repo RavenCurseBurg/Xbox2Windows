@@ -90,6 +90,8 @@
 #include <utility>
 #include <vector>
 
+bool x2w_d3d12_process_terminating = false;
+
 // The heap-indexing bits src/d3d12_xs_shim.cpp removed for the blob it returned at exactly this
 // buffer. A build that compiles this file without the shim (offscreen_check) links the fallback, 0.
 extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes);

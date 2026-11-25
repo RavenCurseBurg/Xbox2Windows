@@ -14,6 +14,15 @@ struct ComputeTranslation {
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    ~ComputeTranslation()
+    {
+        // The per-process cache is destroyed during DLL detach. A driver may already have shut
+        // down when the process is terminating. Explicit unload still releases both references.
+        if (x2w_d3d12_process_terminating) {
+            pipeline.Detach();
+            root.Detach();
+        }
+    }
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated;
