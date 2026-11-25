@@ -1,0 +1,62 @@
+name: Verify folded vertex descriptor carries
+on:
+  push:
+    branches: [measure/vertex-pointer-carry-readback]
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 2b57389c36e49b8664e6bd06e7962e0f4d9af213
+          persist-credentials: false
+      - name: Build and verify the paired vertex readback
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          $python = (Resolve-Path out/pe-env/Scripts/python.exe).Path
+          & $python -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          cmake --build --preset release --target startup_stream_consumer
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          $build = (Resolve-Path out/build/release).Path
+          $stage = New-Item -Type Directory -Force out/carry-artifact
+          foreach ($name in 'startup_stream_consumer.exe','d3d12_xs.dll','xg_xs.dll') {
+            Copy-Item -LiteralPath "$build/$name" -Destination $stage
+          }
+          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
+          Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
+          ctest --preset release --no-tests=error -j 1 -R '^startup_(gfx2hlsl_(desc_ptr_prop|sop2_complement)|stream_fetch_(translate|warp))$' -V
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          $env:X2W_D3D12_DEBUG='1'
+          foreach ($kind in 'fxc','dxc') {
+            $key = if ($kind -eq 'fxc') { 'STARTUP_FXC' } else { 'DXC_EXECUTABLE' }
+            $line = @(Select-String -LiteralPath "$build/CMakeCache.txt" -Pattern "^$key\x3aFILEPATH=(.+)$")
+            if ($line.Count -ne 1) {throw "$kind not found"}
+            $compiler = $line[0].Matches[0].Groups[1].Value
+            $output = & $python -B tests/measure_vertex_pointer_carry.py draw "$build/startup_stream_consumer.exe" warp $kind $compiler 2>&1
+            $code = $LASTEXITCODE
+            $output | Tee-Object -FilePath "out/carry-$kind.log"
+            if ($code -ne 0) {throw "$kind exited $code"}
+            foreach ($number in 0,11) {
+              if (@($output | Select-String "32 pixels match; $number differ from POSITION").Count -ne 3) {throw 'Missing readback'}
+            }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carry-consumer
+          path: out/carry-artifact/
+          retention-days: 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carry-logs
+          path: out/carry-*.log
+          retention-days: 2
