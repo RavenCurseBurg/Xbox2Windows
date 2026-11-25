@@ -19,7 +19,7 @@ jobs:
       - name: Run both fixtures with an 8.3 temporary directory
         shell: pwsh
         run: |
-          $fixtureDir = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'Long fixture directory')
+          $fixtureDir = New-Item -ItemType Directory -Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp/Long fixture directory')
           $fso = New-Object -ComObject Scripting.FileSystemObject
           $env:TMPDIR = $fso.GetFolder($fixtureDir.FullName).ShortPath
           if ($env:TMPDIR -eq $fixtureDir.FullName) { throw 'Runner did not provide an 8.3 path for the fixture' }
