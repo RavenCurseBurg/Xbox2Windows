@@ -21,12 +21,12 @@ struct ViewAt {
 };
 static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
 
-bool bind_view_table(void* guest, void* list, Word& cpu)
+bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1)
 {
     struct Extended {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word address, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void* heap = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return false;
     cpu = invoke(heap, 9);
@@ -58,7 +58,8 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
                                                0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[i]))))) return 41;
     }
     Word cpu = 0;
-    if (!bind_view_table(guest, list, cpu)) return 42;
+    const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
+    if (!bind_view_table(guest, list, cpu, joined_table ? 2 : 1)) return 42;
     ViewAt v{};
     v.view.Format = DXGI_FORMAT_R8_UNORM;
     v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -69,6 +70,22 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
     };
+    if (joined_table) {
+        const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (stride != 32) {
+            std::printf("the fixture uses 32-byte guest descriptors, got %llu\n", stride);
+            return 77;
+        }
+        for (UINT swap = 0; swap < 2; ++swap) {
+            for (UINT i = 0; i < 2; ++i)
+                invoke(guest, 18, ptr(placed[i ^ swap]), ptr(&v.view), cpu + i * stride);
+            for (UINT key = 0; key < 4; ++key) {
+                invoke(list, 40, 1, 1, ptr(&key), 0);
+                draw(static_cast<LONG>(swap * 4 + key));
+            }
+        }
+        return 0;
+    }
     const auto publish = [&](const D3D12_RESOURCE_DESC& resource_desc, Word address) {
         v.address = address;
         invoke(guest, 70, ptr(&resource_desc), ptr(&v), cpu);
