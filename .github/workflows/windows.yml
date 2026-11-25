@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: d041967afdaf8ba3c8c1e5a47b569552bd3d6654
+          ref: 99e42a0c5b53058ef44a0e1596c972959fcaedad
           persist-credentials: false
       - name: Build the Release renderer at the experiment commit
         shell: pwsh
@@ -47,6 +47,12 @@ jobs:
           $rows | Set-Content out/compute-cases.log
           $rows | Select-Object -Last 17
           if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 5')) {throw "Case controls failed or skipped ($rc)"}
+          $tests = (ctest --preset release --show-only=json-v1 -R '^compute_store_aot_descriptor_load_format_warp$') | ConvertFrom-Json
+          $command = $tests.tests[0].command
+          $rows = & $command[0] -B tests/measure_compute_batch_controls.py $command[4] $command[5] warp 2>&1
+          $rc = $LASTEXITCODE
+          $rows | Tee-Object -Append -FilePath out/compute-cases.log
+          if ($rc -or $rows -match 'skip \(77\)' -or -not ($rows -match "pass', 'error', 'error")) {throw "Compute controls failed or skipped ($rc)"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
