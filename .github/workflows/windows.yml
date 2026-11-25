@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: a0122ece9915dca4a40371b4c4a32cd9d68dbcf4
+          ref: c133da0ad980708bbb63f353eefcc56e3851bb2c
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -37,6 +37,6 @@ jobs:
           ctest --preset dev --no-tests=error -V -R '^startup_gfx2hlsl_(compute_.*|saveexec_same_reg_controls)$' -E 'hardware' | Tee-Object -FilePath out/compute-readback.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (Select-String -Quiet -Path out/compute-readback.log -Pattern '\*\*\*Skipped|\*\*\*Not Run') { throw 'A selected test skipped' }
-          foreach ($expected in 'case F: all 320 words match','control f-peer: rejected at word=0 expected=00000020 actual=00000000','control f-broadcast: rejected at word=1 expected=00000025 actual=00000024') {
+          foreach ($expected in 'case G: all 320 words match','control g-swapped-offsets: rejected at word=0 expected=00000004 actual=00000000','control g-overlap: rejected at word=1 expected=00000000 actual=00000004','debug_layer=enabled','debug_errors=0 debug_warnings=0') {
             if (!(Select-String -Quiet -Path out/compute-readback.log -SimpleMatch $expected)) { throw "Missing measured result: $expected" }
           }
