@@ -177,8 +177,9 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Texture2D.MostDetailedMip = first_mip;
         view.Texture2D.MipLevels = view_levels;
+        const auto bound = x2w_startup::decode_statics(samplers).front();
         std::printf("lod_query resource_base=%u resource_mips=%u view_first=%u view_levels=%u sampler_min=%g sampler_max=%g\n",
-                    base, levels, first_mip, view_levels, samplers.statics[0].MinLOD, samplers.statics[0].MaxLOD);
+                    base, levels, first_mip, view_levels, bound.MinLOD, bound.MaxLOD);
     }
     device->CreateShaderResourceView(texture.Get(), lod_query ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
