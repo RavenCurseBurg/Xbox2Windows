@@ -165,13 +165,19 @@ static void* desktop_pipeline(void* device)
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
+static void* slot67_other_root;  // a second root signature object, for the root-change controls
 
-// Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (slot 39), a
+// Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (word 0 by slot
+// 37, word 1 by slot 39; a slot 40 call with other words in between must not reach them), a
 // table (slot 35) of two 16-byte hardware buffer descriptors written into the title heap's memory, and Dispatch
 // (slot 14) of 3x2x2 groups with the slot 67 placeholder bound. Input and output are placed buffers 64 KiB apart
 // in one allocation, so both alias this process's memory and the result is read from that memory after the queue's
 // fence. dispatch-swapped exchanges the two descriptors (the output then names the buffer without unordered
 // access); dispatch-none records everything but the Dispatch. The 320 output words go to X2W_TEST_DISPATCH_OUT.
+// Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
+// another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
+// dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
+// root; dispatch-same-buffer names the output buffer as the input too.
 static int dispatch_slot67(void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -190,7 +196,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
-        const UINT64 address = reinterpret_cast<UINT64>(buffers[i]);
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | 4u << 16, words, 0};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
@@ -209,12 +215,23 @@ static int dispatch_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
-    const UINT constants[2] = {0x01234567, 0x9e3779b9};
+    const UINT constants[2] = {0x01234567, 0x9e3779b9}, graphics[2] = {0xdeadbeef, 0xfeedface};
+    const auto bind = [&] {
+        invoke(list, 32, 1, word(&heap));
+        invoke(list, 25, word(slot67_pipeline));
+        invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
+    };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
-    invoke(list, 32, 1, word(&heap));
-    invoke(list, 25, word(slot67_pipeline));
-    invoke(list, 33, word(slot67_root));
-    invoke(list, 39, 0, 2, word(constants), 0);
+    bind();
+    if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
+    invoke(list, 40, 0, 2, word(graphics), 0);
+    invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    if (mode == "dispatch-root-changed") invoke(list, 33, word(slot67_other_root));
+    if (mode == "dispatch-root-changed" || mode == "dispatch-same-root") invoke(list, 33, word(slot67_root));
+    if (mode == "dispatch-reset") {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+        bind();
+    }
     invoke(list, 35, 1, gpu);
     if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
@@ -241,6 +258,7 @@ static bool create_slot67(void* device, const char* code_path, const char* data_
     std::vector<char> state{std::istreambuf_iterator<char>(state_file), {}};
     if (code.empty() || data.empty() || state.empty() || !stream_root_signature()) return false;
     void* root = stream_root_signature();
+    slot67_other_root = root;
     char root_path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_COMPUTE_ROOT", root_path, MAX_PATH);
     if (n && n < MAX_PATH) {

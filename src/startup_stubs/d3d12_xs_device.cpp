@@ -90,6 +90,8 @@
 #include <utility>
 #include <vector>
 
+bool x2w_d3d12_process_terminating = false;
+
 // The heap-indexing bits src/d3d12_xs_shim.cpp removed for the blob it returned at exactly this
 // buffer. A build that compiles this file without the shim (offscreen_check) links the fallback, 0.
 extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes);
@@ -2273,10 +2275,10 @@ struct Pass {
     ID3D12RootSignature* compute_root = nullptr; // latest guest root if it was forwarded
     x2w_startup::ComPtr<ID3D12RootSignature> desktop_compute_root; // last root actually set on this recording
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
-    const std::vector<RootParameter>* compute_params = nullptr;
-    std::unique_ptr<ComputeBindingTrace> compute_trace;
     ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
     UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
+    const std::vector<RootParameter>* compute_params = nullptr;
+    std::unique_ptr<ComputeBindingTrace> compute_trace;
     bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
@@ -2299,7 +2301,7 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
-    x2w_root_constants::Store constants;          // graphics root constants (slot 40)
+    std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
     x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
     Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
@@ -2515,6 +2517,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
+    pass.compute_srv_bound = 0;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
@@ -2953,7 +2958,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 list->SetGraphicsRootShaderResourceView(srv, inputs[0].resource->GetGPUVirtualAddress() + inputs[0].offset);
             for (UINT i = 0; i < pass.root->size(); ++i) {
                 if (i == srv) continue;
-                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants.words[i], 0);
+                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
             }
         }
     }
@@ -2997,7 +3002,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (pass.root != params) {
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
-        pass.constants.clear();
+        std::memset(pass.constants, 0, sizeof(pass.constants));
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;

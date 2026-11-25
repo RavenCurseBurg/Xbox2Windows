@@ -1,5 +1,5 @@
 // Experimental (docs/startup-runtime.md, #870): the root constants a command list keeps for compute
-// (list slots 37 and 39) and graphics (slot 40). Plain standard C++; synthetic values, no title data.
+// (list slots 37 and 39). Plain standard C++; synthetic values, no title data.
 #include "../src/startup_stubs/root_constant_store.h"
 
 #include <cstdio>
@@ -42,8 +42,19 @@ int main()
     expect(store.set_one(15, 5, 0) == Result::stored && store.word(15, 0) == 5, "parameter 15 is the last one kept");
     expect(store.word(16, 0) == 0 && store.word(-1, 0) == 0 && store.word(0, 8) == 0, "reads outside the range give 0");
 
+    expect(store.is_bound(3, 2, 4) && store.is_bound(3, 3, 1), "written words are marked set");
+    expect(!store.is_bound(3, 1, 1) && !store.is_bound(3, 1, 2) && !store.is_bound(3, 6, 1),
+           "words never written are not set, and a range with one unset word is not set");
+    expect(store.is_bound(6, 6, 2) && !store.is_bound(6, 6, 3), "a cut-off write marks only the words that fit");
+    expect(!store.is_bound(0, 0, 1), "a dropped write marks nothing");
+    expect(!store.is_bound(16, 0, 1) && !store.is_bound(0, 8, 1) && !store.is_bound(0, 0, 0) && !store.is_bound(0, 7, 2),
+           "ranges outside the kept words are never set");
+    expect(store.set_one(1, 0, 0) == Result::stored && store.is_bound(1, 0, 1) && store.word(1, 0) == 0,
+           "writing 0 is set, unlike never written");
+
     store.clear();
     expect(store.word(3, 2) == 0 && store.word(15, 0) == 0, "clear zeroes every word");
+    expect(!store.is_bound(3, 2, 4) && !store.is_bound(1, 0, 1), "clear forgets which words were set");
 
     if (failures) return 1;
     std::puts("root constant store ok");
