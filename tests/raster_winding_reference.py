@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 
 VERTEX = """
 float4 main(uint id : SV_VertexID) : SV_Position {
-    float2 triangle[3] = {float2(-1, 1), float2(-0.0625, 1), float2(-1, -1)};
-    float2 p = triangle[id % 3];
+    float2 points[3] = {float2(-1, 1), float2(-0.0625, 1), float2(-1, -1)};
+    float2 p = points[id % 3];
     if (id >= 3) p.x = -p.x;
     return float4(p, 0.5, 1);
 }
