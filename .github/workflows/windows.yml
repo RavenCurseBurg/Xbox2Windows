@@ -1,16 +1,16 @@
-name: Verify descriptor SCC and shader cache keys
+name: Verify SAVEEXEC readback with the WARP debug layer
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  d16:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/descriptor-scc'
+  readback:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/saveexec-compute-readback'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 3e750a3782595820f4e920ac8eb765cf10347f17
+          ref: af9df2ab8eb6036fdb727d742418a9d225527be3
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -32,7 +32,9 @@ jobs:
           } finally { $zip.Dispose() }
           cmake --preset dev "-DOFFSCREEN_AGILITY_620_DIR=$($sdk.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset dev --target offscreen_check startup_indirect_draw_indexed
+          cmake --build --preset dev --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -V -R '^(startup_gfx2hlsl_compute_|startup_compute_request_offline$|startup_indirect_(draw_indexed|translated_draw|translated_indexed)_warp$)' -E 'hardware'
-          exit $LASTEXITCODE
+          ctest --preset dev --no-tests=error -V -R '^startup_gfx2hlsl_(compute_.*|saveexec_same_reg_controls)$' -E 'hardware' | Tee-Object -FilePath out/compute-readback.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (Select-String -Quiet -Path out/compute-readback.log -Pattern '\*\*\*Skipped|\*\*\*Not Run') { throw 'A selected test skipped' }
+          if (!(Select-String -Quiet -Path out/compute-readback.log -SimpleMatch 'case E: all 320 words match')) { throw 'SAVEEXEC did not dispatch' }
