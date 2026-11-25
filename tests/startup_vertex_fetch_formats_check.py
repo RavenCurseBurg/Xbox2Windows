@@ -48,6 +48,7 @@ FORMATS = {
     'BUF_FMT_16_16_SNORM': (24, 6, 2, 16, 'snorm', 2),
     'BUF_FMT_16_16_FLOAT': (29, 10, 10, 16, 'f16', 2),
     'BUF_FMT_16_16_16_16_FLOAT': (71, 18, 10, 16, 'f16', 4),
+    'BUF_FMT_2_10_10_10_UNORM': (50, 5, 3, 10, 'unorm', 4),
     'BUF_FMT_8_8_8_8_UNORM': (56, 5, 3, 8, 'unorm', 4),
     'BUF_FMT_32_FLOAT': (22, 8, 4, 32, 'f32', 1),
     'BUF_FMT_32_32_FLOAT': (64, 12, 0, 32, 'f32', 2),
@@ -69,15 +70,20 @@ def reference(name, vertex, *, swap=False, shift=False, w_zero=False, unorm_pow2
     """The four compared words of one vertex, from the format definition. The keywords give wrong references."""
     _, stride, offset, bits, kind, count = FORMATS[name]
     address, size = vertex * stride + offset, bits // 8
-    fields = [int.from_bytes(DATA[address + size * i:address + size * (i + 1)], 'little') for i in range(count)]
-    if shift and bits < 32:
-        # Each field read one field higher, as a wrong shift would; the last reads past the element.
+    if bits == 10:
+        packed, = struct.unpack_from('<I', DATA, address)
+        if shift:
+            packed >>= 1
+        fields = [packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 1023, packed >> 30]
+    elif shift and bits < 32:
         fields = [int.from_bytes(DATA[address + size * (i + 1):address + size * (i + 2)], 'little') for i in range(count)]
+    else:
+        fields = [int.from_bytes(DATA[address + size * i:address + size * (i + 1)], 'little') for i in range(count)]
     if swap and count > 1:
         fields[0], fields[1] = fields[1], fields[0]
     if kind == 'unorm' and unorm_pow2:
         # v = field / 2^bits, compared as round(v * (2^bits - 1)).
-        fields = [round(f * ((1 << bits) - 1) / (1 << bits)) for f in fields]
+        fields = [round(f * scale / (scale + 1)) for f, scale in zip(fields, compared(name))]
     if kind == 'snorm':
         fields = snorm_words(fields, unsigned=unsigned, no_clamp=no_clamp)
     words = [f16(f) if kind == 'f16' else f for f in fields]
@@ -89,6 +95,8 @@ def reference(name, vertex, *, swap=False, shift=False, w_zero=False, unorm_pow2
 def compared(name):
     """Return the integer readback scale for each normalized component."""
     _, _, _, bits, kind, count = FORMATS[name]
+    if bits == 10:
+        return [1023, 1023, 1023, 3]
     scale = {'unorm': (1 << bits) - 1, 'snorm': (1 << (bits - 1)) - 1}.get(kind)
     return [scale if i < count else None for i in range(4)]
 
@@ -130,6 +138,9 @@ void readback(uint id : SV_GroupIndex) {
 
 # Translations a wrong table entry would produce: (format, label, generated text, replacement).
 MUTATIONS = (
+    ('BUF_FMT_2_10_10_10_UNORM', 'blue from green', '((w >> 20) & 1023)', '((w >> 10) & 1023)'),
+    ('BUF_FMT_2_10_10_10_UNORM', 'alpha normalized by four', '(w >> 30) / 3.0', '(w >> 30) / 4.0'),
+    ('BUF_FMT_2_10_10_10_UNORM', 'aligned load', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
     ('BUF_FMT_8_8_8_8_UNORM', 'second byte from the third', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)'),
     ('BUF_FMT_8_8_8_8_UNORM', 'fourth byte as 255', 'U((w >> 24) / 255.0)', 'U(1.0)'),
     ('BUF_FMT_8_8_UNORM', 'aligned load instead of ldu', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
