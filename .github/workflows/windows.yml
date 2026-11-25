@@ -1,18 +1,26 @@
-name: Build and run the slot 67 indirect fixture
+name: Check live slot 67 translation and shutdown
 on:
   push:
-    branches: ['verify/slot67-indirect-dispatch']
+    branches: ['verify/slot67-compute-live-retry']
 permissions:
   contents: read
 jobs:
   timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/slot67-indirect-dispatch'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/slot67-compute-live-retry'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: exact
+            source: 3d596a2845e3267eb530f2dad2ee0524d5105476
+          - label: lifetime
+            source: 966a3b8db4d6a3642c02f3d9b6b1c810b933b901
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 4cbd57e754f672c3de840f235dba6b2dd579ddef
+          ref: ${{ matrix.source }}
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -36,22 +44,22 @@ jobs:
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: slot67-consumer
+          name: slot67-consumer-${{ matrix.label }}
           path: out/mrt-artifact/
           retention-days: 2
           if-no-files-found: error
-      - name: Run the new and existing dispatch fixtures on WARP
+      - name: Check late publication on the same pipeline and direct Dispatch on WARP
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(slot67_indirect_dispatch|compute_dispatch|indirect_dispatch|indirect_count|indirect_root_constants)_warp$' 2>&1
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(compute_live_retry|compute_dispatch)_warp$' 2>&1
           $result=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
           if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: slot67-results
+          name: slot67-results-${{ matrix.label }}
           path: out/slot67-warp.log
           if-no-files-found: ignore
           retention-days: 2
