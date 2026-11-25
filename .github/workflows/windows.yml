@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 2a6f9133cf733bfa2f22da274cdbbd4e3f9d167c
+          ref: 9e5361b12731e4faa827bcd26df8c0ef24ae64d2
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -34,6 +34,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build out/d16-check --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir out/d16-check --no-tests=error -V -R '^(startup_gfx2hlsl_image_get_lod_controls|startup_image_(get_lod_view|2d_array|sample_lod)_warp)$' | Tee-Object out/lod-warp.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $log = Get-Content -Raw out/lod-warp.log
+          if ($log -match '\*\*\*Skipped|\*\*\*Not Run' -or $log -notmatch '4 tests passed|4 tests out of 4|0 tests failed out of 4') { throw 'Missing selected WARP tests' }
+          foreach ($expected in 'debug_layer=enabled','debug_errors=0 debug_warnings=0','ordinary sampler control rgba=40000000400000004000000040000000','view=1/1 step=1') {
+            if (!$log.Contains($expected)) { throw "Missing output: $expected" }
+          }
           $stage = New-Item -Force -ItemType Directory out/d16-artifact
           Copy-Item -LiteralPath out/d16-check/offscreen_check.exe -Destination $stage
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
