@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - label: live-retry
-            source: 085ade1532064a40bf39c6dfbe45d4203fa98bcc
+            source: 2e02985794d08c14d1cb9a0adb811c4366fc4971
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -50,8 +50,11 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
+          out/pe-env/Scripts/python.exe -B tests/startup_slot67_indirect_dispatch_check.py mutation
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(compute_live_retry|compute_dispatch|slot67_indirect_dispatch|indirect_dispatch|indirect_root_constants|indirect_count)_warp$' 2>&1
           $result=$LASTEXITCODE
+          if (-not ($rows -match '100% tests passed out of 6')) {throw 'Expected six passing WARP tests'}
           $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
           if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
