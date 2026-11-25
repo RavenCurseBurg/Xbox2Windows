@@ -1,4 +1,4 @@
-name: Build the heap-store fixture renderer
+name: Build the compute gather fixture renderer
 
 on: workflow_dispatch
 
@@ -7,14 +7,14 @@ permissions:
 
 jobs:
   renderer:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/heap-store-renderer'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/compute-gather-lz-renderer'
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           repository: R0Y00/Xbox2Windows
-          ref: ab9a020c0783f9ce1dd10876cbeb119707b9ada9
+          ref: ed96f4989e9af8abf1afe47074314adbae3a57b2
           persist-credentials: false
       - name: Build and smoke-test the upstream GPU package
         shell: pwsh
