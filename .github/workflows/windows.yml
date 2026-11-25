@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 3d1a9d32afa1deab874137de1e8e2eeab773b5b2
+          ref: 1bf7826217e7c18b53676649fb7a375323e5b565
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -24,10 +24,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --preset dev -B out/mrt -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mrt --target startup_stream_consumer
+          cmake --build out/mrt --target startup_stream_consumer offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe') {
+          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','offscreen_check.exe') {
             $files = @(Get-ChildItem out/mrt -File -Recurse -Filter $name)
             if ($files.Count -ne 1) { throw "Expected one built $name" }
             Copy-Item -LiteralPath $files[0].FullName -Destination $stage
@@ -44,10 +44,11 @@ jobs:
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_joined_table_pointer_(cpu|(fxc|dxc)_warp)$' 2>&1
+          $rows=ctest --test-dir out/mrt -V --no-tests=error -R '^startup_(joined_table_pointer_(cpu|(fxc|dxc)_warp)|gfx2hlsl_compute_(controls|warp))$' 2>&1
           $rc=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/graphics-table.log | Select-Object -Last 20
           if ($rc -or $rows -match '\*\*\*Skipped|Not Run') {throw "CTest failed or skipped (exit $rc)"}
+          if (-not ($rows -match 'case I-raw: all 320 words match')) {throw 'Missing structured-to-raw compute readback'}
           foreach ($kind in 'fxc','dxc') {
             foreach ($change in 0,32) {
               $seen=@($rows | Select-String -Pattern "$kind warp table byte (0|32), $change pixels changed from the source expectation")
