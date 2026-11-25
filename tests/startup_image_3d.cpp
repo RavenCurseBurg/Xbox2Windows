@@ -70,7 +70,21 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
                             bool two_dimensional)
 {
-    if (levels < 1 || levels > max_levels || (levels > 1 && !array))
+    // Measurement for the startup image_get_lod fixture on a 4x4, three-mip 2D resource.
+    char selection[8]{};
+    const DWORD selection_size = two_dimensional ? GetEnvironmentVariableA("X2W_GET_LOD_VIEW", selection, sizeof(selection)) : 0;
+    if (selection_size >= sizeof(selection)) throw std::runtime_error("X2W_GET_LOD_VIEW is too long");
+    const bool lod_query = selection_size != 0;
+    UINT first_mip = 0, view_levels = 0;
+    if (lod_query) {
+        levels = 3;
+        if (!std::strcmp(selection, "0/3")) { first_mip = 0; view_levels = 3; }
+        else if (!std::strcmp(selection, "1/2")) { first_mip = 1; view_levels = 2; }
+        else if (!std::strcmp(selection, "1/1")) { first_mip = 1; view_levels = 1; }
+        else if (!std::strcmp(selection, "0/1")) { first_mip = 0; view_levels = 1; }
+        else throw std::runtime_error("Expected 0/3, 1/2, 1/1 or 0/1 for X2W_GET_LOD_VIEW");
+    }
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !lod_query))
         throw std::runtime_error("Unsupported image mip level count");
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
@@ -110,7 +124,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
     // The subresource of slice s and mip m is m + s * levels.
-    const UINT subresources = array ? side * levels : 1;
+    const UINT subresources = array ? side * levels : lod_query ? levels : 1;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
@@ -124,7 +138,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     for (UINT tz = 0; tz < td.DepthOrArraySize; ++tz)
         for (UINT level = 0; level < levels; ++level) {
             const UINT extent = base >> level;
-            const auto& place = array ? footprints[level + tz * levels] : footprint;
+            const auto& place = array || lod_query ? footprints[level + tz * levels] : footprint;
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
@@ -156,7 +170,17 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image 3D view heap");
-    device->CreateShaderResourceView(texture.Get(), nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    if (lod_query) {
+        view.Format = td.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MostDetailedMip = first_mip;
+        view.Texture2D.MipLevels = view_levels;
+        std::printf("lod_query resource_base=%u resource_mips=%u view_first=%u view_levels=%u sampler_min=%g sampler_max=%g\n",
+                    base, levels, first_mip, view_levels, samplers.statics[0].MinLOD, samplers.statics[0].MaxLOD);
+    }
+    device->CreateShaderResourceView(texture.Get(), lod_query ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
