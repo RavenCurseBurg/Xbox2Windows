@@ -15750,6 +15750,30 @@ cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
 ```
 
+### GPU-written indirect Dispatch for a translated raw-buffer pipeline
+
+Command-list slot 61 accepts one rootless Dispatch record in a placed argument buffer for the same slot 67
+raw-buffer pipeline. It checks the argument range, binds the translated pipeline and descriptors, transitions
+the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts at execution time.
+
+The fixture records a compute producer, the indirect consumer and a copy of the argument record on one list.
+After the queue fence it checks the two guard words, the three argument words, the input buffer and all 320
+output words. With 2 and 5 groups the first 2 and 5 words respectively contain the input XOR a root constant.
+The same pipeline, bindings, and two group counts also run through direct Dispatch against the same reference.
+The zeroed record leaves the whole output untouched when the producer is omitted. A missing translation
+also preserves the output and logs the refusal. Additional cases cover multiple commands, a count buffer,
+an out-of-range record and using the argument buffer as a shader output.
+
+The device-free check uses the same word comparator as the GPU readback. It flips individual
+written and untouched words, checks short and long readbacks, and verifies that the two group
+counts produce different reference values only at indices 2, 3 and 4.
+
+```powershell
+python -B tests/startup_slot67_indirect_dispatch_check.py mutation
+cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
+ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
+```
+
 ## Startup translator: a short operand list is refused, never a translator crash
 
 The batch translator records any non-`Unsupported` exception from a handler as
