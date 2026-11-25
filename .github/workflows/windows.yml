@@ -1,16 +1,16 @@
-name: Verify startup masked bit counts with the D3D12 debug layer
+name: Verify startup D16 image stores with the D3D12 debug layer
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  gather:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/startup-compute-mbcnt'
+  d16:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/startup-compute-d16-store'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 8a689dcdbabcb1aabf55619807db88906c408639
+          ref: 43822328746ab6eee06cca1349187f274018c03b
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -30,31 +30,31 @@ jobs:
               [IO.Compression.ZipFileExtensions]::ExtractToFile($zip.GetEntry("build/native/bin/x64/$name"),(Join-Path $sdk.FullName $name))
             }
           } finally { $zip.Dispose() }
-          cmake --preset dev -B out/mbcnt-check -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DOFFSCREEN_AGILITY_620_DIR=$($sdk.FullName)"
+          cmake --preset dev -B out/d16-check -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DOFFSCREEN_AGILITY_620_DIR=$($sdk.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build out/mbcnt-check --target offscreen_check
+          cmake --build out/d16-check --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stage = New-Item -Force -ItemType Directory out/mbcnt-artifact
-          Copy-Item -LiteralPath out/mbcnt-check/offscreen_check.exe -Destination $stage
+          $stage = New-Item -Force -ItemType Directory out/d16-artifact
+          Copy-Item -LiteralPath out/d16-check/offscreen_check.exe -Destination $stage
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           (Get-FileHash -LiteralPath "$stage/offscreen_check.exe").Hash | Set-Content -Encoding ascii "$stage/RENDERER_SHA256.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: renderer-source-build
-          path: out/mbcnt-artifact/
+          path: out/d16-artifact/
           retention-days: 2
           if-no-files-found: error
       - name: Run WARP and check the debug layer and mismatch counts
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          out/mbcnt-check/offscreen_check.exe --self-test
+          out/d16-check/offscreen_check.exe --self-test
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $lines = ctest --test-dir out/mbcnt-check --no-tests=error -V -R '^startup_gfx2hlsl_compute_(controls|warp|mbcnt_warp)$' 2>&1
+          $lines = ctest --test-dir out/d16-check --no-tests=error -V -R '^startup_compute_image_store_d16(_warp)?$' 2>&1
           $rc = $LASTEXITCODE
           $lines | Write-Output
           if ($rc) { exit $rc }
           $log = $lines -join [Environment]::NewLine
-          foreach ($required in 'backend=warp debug_layer=enabled','debug_errors=0 debug_warnings=0','case D-wrap: all 320 words match','control d-mask: rejected at word=8','control d-whole-mask: rejected at word=0','control d-x-only: rejected at word=16','control d-base: rejected at word=0','control d-hi: rejected at word=5','control d-exec: rejected at word=2') {
+          foreach ($required in 'backend=warp debug_layer=enabled','debug_errors=0 debug_warnings=0','full EXEC:','partial EXEC:','compared_halves=1344 mismatches=0','mip=0 half=0 expected=3c00 actual=5000','mip=0 half=0 expected=3c00 actual=c000','mip=0 half=0 expected=3c00 actual=0000','mip=0 half=128 expected=5080 actual=3c08') {
             if ($log -notmatch $required) { throw "Missing result: $required" }
           }
