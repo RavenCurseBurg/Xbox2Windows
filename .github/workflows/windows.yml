@@ -1,16 +1,16 @@
-name: Build the adjacent occlusion query measurement fixture
+name: Build the startup 2D LOD view measurement fixture
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
   d16:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/uhd770-adjacent-queries'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/startup-get-lod-srv'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: d527420e6bf5b76b474d8bc1fe3a2334e6dec1bb
+          ref: 705cf8224bedd9598104913f66b8df03f4c350bd
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -40,7 +40,7 @@ jobs:
           (Get-FileHash -LiteralPath "$stage/offscreen_check.exe").Hash | Set-Content -Encoding ascii "$stage/RENDERER_SHA256.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: adjacent-query-fixture
+          name: startup-get-lod-srv-fixture
           path: out/d16-artifact/
           retention-days: 2
           if-no-files-found: error
