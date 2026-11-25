@@ -2489,7 +2489,10 @@ class Stage:
                 continue
             seen.add((off, stale))
             size, name, asm = instructions[off]
-            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+            # A proven pointer high add consumes its low add's carry symbolically. Its own outgoing
+            # SCC still has no run-time value for a later numeric read.
+            if (stale and effects.get(off) != 'a folded pointer carry'
+                    and off not in self.calculated_pc and reads_scc(name, asm)):
                 yield stale, name
             if off in effects:
                 stale = effects[off] if effects[off] != 'emitted' else None
@@ -3072,6 +3075,7 @@ class Stage:
             return False
         self.sym[d] = ('ptrhi', mark[2])
         getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
+        self.scc_effect = 'a folded pointer carry'
         return True
 
     # scalar ALU with descriptor-word bookkeeping

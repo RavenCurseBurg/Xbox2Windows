@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from startup_flat_param_check import PS_WORDS, root_blob
 
 failures = []
 
@@ -193,6 +194,38 @@ check('out-of-place low add with a copied, unadvanced high word is refused', isi
 s = run(ROOT, [ADVANCE[0], ADVANCE[1]] + LOAD)
 check('complete out-of-place pair leaves the original high source untouched',
       not isinstance(s, str) and s.sym.get(9) == ('ptrhi', ('root', 1)), str(s if isinstance(s, str) else s.sym))
+
+# Exercise the full pipeline, including the final check for numeric reads of an elided SCC.
+# The gfx1013 vertex stage waits for the descriptor, loads one word into v6, then exports
+# that word in all channels of pos0 and param0.
+VB_DRAW = bytes.fromhex('7fc08cbf 000030e000060480 703f8cbf cf0800f806060606 0f0200f806060606 000081bf')
+VB_LOW = '00901880 '        # s_add_u32 s24, s0, 16
+VB_HIGH = '01801982 '       # s_addc_u32 s25, s1, 0
+VB_LOAD = '0c0408f4100000fa'  # s_load_dwordx4 s[16:19], s[24:25], 16
+SELECT = '81801e85 '        # s_cselect_b32 s30, 1, 0
+COMPARE = '028006bf '       # s_cmp_eq_u32 s2, 0
+
+
+def vertex_binding(prefix):
+    try:
+        pipe = G.Pipeline(bytes.fromhex(prefix) + VB_DRAW, PS_WORDS, root_blob())
+    except G.Unsupported as error:
+        return str(error)
+    return [line for line in pipe.manifest().splitlines() if line.startswith('srv ')]
+
+
+for label, prefix, want in (
+    ('direct load at 32', '000408f4200000fa', ['srv 0 buf vb 2']),
+    ('in-place pair', '00900080 01800182 000408f4100000fa', ['srv 0 buf vb 2']),
+    ('out-of-place pair', VB_LOW + VB_HIGH + VB_LOAD, ['srv 0 buf vb 2']),
+    ('copied high instead of carry', VB_LOW + '010399be ' + VB_LOAD,
+     's_load through s24: its high word is not the matching advanced pair'),
+    ('numeric read after high add', VB_LOW + VB_HIGH + SELECT + VB_LOAD,
+     'scc from a folded pointer carry in s_cselect_b32'),
+    ('numeric read after fresh compare', VB_LOW + VB_HIGH + COMPARE + SELECT + VB_LOAD, ['srv 0 buf vb 2']),
+):
+    result = vertex_binding(prefix)
+    check('vertex buffer table: ' + label, result == want, str(result))
 
 if failures:
     print('FAILED: %s' % ', '.join(failures))
