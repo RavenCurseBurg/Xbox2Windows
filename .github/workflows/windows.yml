@@ -1,16 +1,16 @@
-name: Verify LDS exchange with the WARP debug layer
+name: Verify expanded FLOAT2 heap stores on WARP
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
   readback:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/startup-lds-dword'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/heap-d16-float2'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 4ca6e411d462900ed4e9023e635468291edbdd76
+          ref: 85e045382fc652946d7f21112824a667595a7bc3
           persist-credentials: false
       - name: Build the test renderer with the project-supported Agility SDK
         shell: pwsh
@@ -34,9 +34,35 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset dev --target offscreen_check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -V -R '^startup_gfx2hlsl_(compute_.*|saveexec_same_reg_controls)$' -E 'hardware' | Tee-Object -FilePath out/compute-readback.log
+          ctest --preset dev --no-tests=error -V -R '^compute_(heap_store_controls|store_aot_heap_view_store_warp)$' | Tee-Object -FilePath out/heap-readback.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if (Select-String -Quiet -Path out/compute-readback.log -Pattern '\*\*\*Skipped|\*\*\*Not Run') { throw 'A selected test skipped' }
-          foreach ($expected in 'case G: all 320 words match','case G-offset0-only: all 320 words match','case G-offset1-only: all 320 words match','control g-swapped-offsets: rejected at word=0 expected=00000004 actual=00000000','control g-overlap: rejected at word=1 expected=00000000 actual=00000004','debug_layer=enabled','debug_errors=0 debug_warnings=0') {
-            if (!(Select-String -Quiet -Path out/compute-readback.log -SimpleMatch $expected)) { throw "Missing measured result: $expected" }
+          if (Select-String -Quiet -Path out/heap-readback.log -Pattern '\*\*\*Skipped|\*\*\*Not Run') { throw 'A selected test skipped' }
+          foreach ($expected in 'heap-store controls passed','warp D16_XY-to-FLOAT2: 17 heap-store cases and 11 shader mutations checked','warp D16_X-to-FLOAT1: 16 heap-store cases and 11 shader mutations checked','warp D16-to-FLOAT4: 12 heap-store cases and 11 shader mutations checked','warp UINT4: 12 heap-store cases and 8 shader mutations checked') {
+            if (!(Select-String -Quiet -Path out/heap-readback.log -SimpleMatch $expected)) { throw "Missing result: $expected" }
           }
+          $runner = (Get-ChildItem out/build -Recurse -Filter offscreen_check.exe | Select-Object -First 1).FullName
+          $dxcLine = (Select-String -Path out/build/dev/CMakeCache.txt -Pattern '^DXC_EXECUTABLE:FILEPATH=').Line
+          $dxc = $dxcLine.Substring($dxcLine.IndexOf('=')+1)
+          @"
+          from pathlib import Path
+          import subprocess, sys, tempfile
+          sys.path.insert(0, "tests")
+          import compute_heap_store_check as t
+          original = subprocess.run
+          total = 0
+          def check(args, **kwargs):
+              global total
+              result = original(args, **kwargs)
+              if "--compute-store-case" in args:
+                  assert "debug_layer=enabled" in result.stdout, result.stdout
+                  if result.returncode == 0:
+                      assert "debug_errors=0 debug_warnings=0" in result.stdout, result.stdout
+                      total += 1
+              return result
+          subprocess.run = check
+          with tempfile.TemporaryDirectory() as tmp:
+              assert t.draw(Path(tmp), sys.argv[1], sys.argv[2], "warp", "d16_xy") == 0
+          assert total == 17, total
+          print(f"{total} positive FLOAT2 dispatches with debug layer enabled and zero warnings/errors")
+          "@ | out/pe-env/Scripts/python.exe -B - $dxc $runner
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
