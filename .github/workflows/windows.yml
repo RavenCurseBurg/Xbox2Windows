@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - label: live-retry
-            source: 86415999f855f81d4de368269915ed7ece008ed4
+            source: 085ade1532064a40bf39c6dfbe45d4203fa98bcc
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
