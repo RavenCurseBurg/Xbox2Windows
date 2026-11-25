@@ -253,12 +253,12 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
     if (!entry) {
         entry = new Translation;
         entry->key = key;
-        // A legacy cache hit still needs source blobs for late RTV specialization.
-        if (publish_shader_request(key, L".b", b, b_bytes) &&
+        // Measurement-only control: omit republication on an already compiled base cache hit.
+        load_translation(*entry);
+        if (entry->state != 1 && publish_shader_request(key, L".b", b, b_bytes) &&
             publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
             (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())))
             publish_shader_request(key, L".a", a, a_bytes);
-        load_translation(*entry);
     }
     return entry;
 }
