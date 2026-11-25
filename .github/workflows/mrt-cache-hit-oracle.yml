@@ -64,7 +64,11 @@ jobs:
             if ($rows -match 'Not Run|\*\*\*Skipped' -or (($rc -eq 0) -ne $shouldPass)) {
               throw "$short on $env:NATIVE_MODE returned $rc, expected pass=$shouldPass"
             }
+            if (-not $shouldPass -and -not ($rows -match 'No such file or directory:.*req_436abe4fb591694e\.a')) {
+              throw "$short failed without identifying the missing shader request"
+            }
           }
+          exit 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
