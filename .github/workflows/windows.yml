@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: e640e28a83ecd1e4f067e3348c2e5287bd761cf1
+          ref: af63f0dcf208f2cdaaa1d0e4c547ceebbd428d1a
           persist-credentials: false
       - name: Build the source and execute single-slice and array tests
         shell: pwsh
@@ -62,4 +62,26 @@ jobs:
           $rc = $LASTEXITCODE
           $lines | Write-Output
           if ($rc -eq 0 -or ($lines -join ' ') -notmatch 'assert copy_from\(computer, result, 0, level, 0, guest, row_pitch, 0\) == 0') { throw 'Expected a refusal of the valid zero-option call' }
+          exit 0
+
+      - name: Check both clients reject an inverted Scarlett-option guard
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          git restore -- src/startup_stubs/xg_xs.cpp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $path = (Resolve-Path src/startup_stubs/xg_bc64.inl).Path
+          $src = [IO.File]::ReadAllText($path)
+          $mutant = $src.Replace('if (scarlett_option != 0)', 'if (scarlett_option == 0)')
+          if ($mutant -ceq $src) { throw 'Missing option guard' }
+          [IO.File]::WriteAllText($path,$mutant)
+          cmake --build out/bc-check --target startup_stub_xg_xs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($case in 'chain','array') {
+            $lines = ctest --test-dir out/bc-check --no-tests=error -V -R "^startup_xg_bc_${case}_warp$" 2>&1
+            $rc = $LASTEXITCODE
+            $lines | Write-Output
+            $expected = if ($case -eq 'chain') { 'assert copy_from\(computer, result, 0, level, 0, guest, row_pitch, 0\) == 0' } else { 'assert COPY_FROM\(vt\[9\]\)\(instance, dst, 0, sub, 0, base, pitch, len\(linear\)\) == 0' }
+            if ($rc -eq 0 -or ($lines -join ' ') -cnotmatch $expected) { throw "Missing expected $case rejection" }
+          }
           exit 0
