@@ -464,7 +464,8 @@ OperationResult run_readback_batch(const OperationContext& ctx, AfterCase after_
 {
     const std::string_view operation(ctx.argv[2]);
     const bool pairs = operation == "--check-pixel-pairs";
-    const bool compute = operation == "--compute-store-batch";
+    const bool compute = operation == "--compute-store-batch" || operation == "--compute-batch-debug-control" ||
+                         operation == "--compute-batch-removal-control";
     const int stride = pairs ? 2 : 1;
     bool failed = false;
     for (int i = 4, index = 0; i < ctx.argc; i += stride, ++index) {
@@ -1633,6 +1634,8 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--compute-store-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
+    {"--compute-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
+    {"--compute-batch-removal-control", 7, 7, nullptr, kNoGate, run_pixel_batch_removal_control},
     {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
