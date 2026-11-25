@@ -1,7 +1,7 @@
-name: Build the pixel fixture for physical adapter timing
+name: Verify per-case shader selection and batch diagnostics
 on:
   push:
-    branches: ['measure/448-intel-split']
+    branches: ['verify/pixel-batch-pairs']
 permissions:
   contents: read
 jobs:
@@ -12,9 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 82bb67ef70221f5c2d9a714f1ce379903258793a
+          ref: 3ac087b05bddc78daa16783dfee318e41d841583
           persist-credentials: false
-      - name: Build the Debug renderer and export the generated CTest registrations
+      - name: Build the Debug renderer and run the WARP fixtures with the debug layer
         shell: pwsh
         run: |
           ./tools/dev.ps1
@@ -28,16 +28,17 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory out/pixel-timing
           $build = 'out/build/dev'
-          Copy-Item "$build/offscreen_check.exe","$build/CTestTestfile.cmake" -Destination $stage
-          ctest --preset dev --show-only=json-v1 -R '^pixel_aot_(hardware|core_vector_hardware|comparisons_hardware|predicate_rounding_hardware)$' | Set-Content "$stage/hardware.json"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $entries = (Get-Content -Raw "$stage/hardware.json" | ConvertFrom-Json).tests
-          if ($entries.Count -ne 4) { throw 'Expected four CTests' }
+          Copy-Item "$build/offscreen_check.exe" -Destination $stage
+          $rows = ctest --preset dev -V -j 1 --no-tests=error -R '^(offscreen_capability_table_self_test|pixel_batch_(pairs|debug|removal)_warp)$' 2>&1
+          $rc = $LASTEXITCODE
+          $rows | Set-Content "$stage/ctest.log"
+          $rows | Select-Object -Last 12
+          if ($rc -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '0 tests failed out of 4')) {throw "CTest exited $rc"}
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pixel-timing-dev
+          name: pixel-pairs-dev
           path: out/pixel-timing/
           if-no-files-found: error
           retention-days: 2
