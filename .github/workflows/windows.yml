@@ -1,5 +1,8 @@
 name: Verify startup stream adapter selection
-on: workflow_dispatch
+on:
+  push:
+    branches: ['verify/startup-stream-adapter-filter']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
