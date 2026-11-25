@@ -7347,6 +7347,14 @@ Driver (`1414:008c`, driver `10.0.26100.9818`) and NVIDIA GeForce RTX 5090 (`10d
 with LLVM 15.0.7. This shows that the translated select computes the stated words on desktop GPUs, not that the
 console does. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sdwa_cndmask(_warp|_hardware)?$' -V`.
 
+The same tests draw a second pixel stage with a `BYTE_1` destination under `UNUSED_PAD` and a `DWORD` destination.
+The first select overwrites a byte of `0xdeadbeef` and must clear the other three bytes. The second must retain
+all 32 bits of its selected source. The shader splits both results into 16-bit halves and exports each half in
+the mantissa of 1.0. The four float channels therefore carry all 64 result bits. Changing padding to
+`UNUSED_PRESERVE` changes 512 of the 1,024 model words. Narrowing `DWORD` to `WORD_0` changes 254.
+Both altered programs must produce a pixel mismatch against the reference and match their own words.
+The `binary` check also reassembles these three programs with LLVM 15. The second stage adds five draws per compiler.
+
 **The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
 forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
 issue #1797). They now lower to a ten-class helper carried in the shader preamble (ported from
