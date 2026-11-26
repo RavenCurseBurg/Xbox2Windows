@@ -1,0 +1,40 @@
+name: Build the served renderer for native adapter verification
+on:
+  push:
+    branches: ['tests/served-native-comparison']
+permissions:
+  contents: read
+jobs:
+  renderer:
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 6c2e55d1b8db5d281ad30499a52b36ef86eea87d
+          persist-credentials: false
+      - name: Build and verify the renderer
+        shell: pwsh
+        run: |
+          ./tools/dev.ps1
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          out/pe-env/Scripts/python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release --target offscreen_check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stage = New-Item -ItemType Directory out/verified-renderer
+          Copy-Item out/build/release/offscreen_check.exe $stage
+          & "$stage/offscreen_check.exe" --self-test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
+          (Get-FileHash "$stage/offscreen_check.exe").Hash | Set-Content -Encoding ascii "$stage/SHA256.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-served-renderer
+          path: out/verified-renderer/
+          if-no-files-found: error
+          retention-days: 2
