@@ -1,7 +1,6 @@
 name: Validate hardware selection for indirect Dispatch
 on:
-  push:
-    branches: ['verify/indirect-dispatch-adapter-filter']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
