@@ -157,7 +157,15 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     const UINT vertex_slot = trace_slot + 1;
     params[trace_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC layout{};
-    params[vertex_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    const bool bounded_vertices = vertices && !fallback && mode == MeshDrawMode::color &&
+                                  binding == MeshConstantBinding::root;
+    D3D12_DESCRIPTOR_RANGE vertex_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    if (bounded_vertices) {
+        params[vertex_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[vertex_slot].DescriptorTable = {1, &vertex_range};
+    } else {
+        params[vertex_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    }
     const bool separate_roots = fallback && textured;
     const UINT input_slots = vertex_slot + vertices;
     const UINT geometry_slot = separate_roots ? trace_slot : input_slots;
@@ -331,7 +339,27 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         list->SetGraphicsRootConstantBufferView(0, cbv[0]);
         list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     }
-    if (vertices && !fallback) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
+    ComPtr<ID3D12DescriptorHeap> vertex_heap;
+    if (bounded_vertices) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = 1;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&vertex_heap)), "Create mesh vertex SRV heap");
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.FirstElement = 2 * cb_bytes / sizeof(UINT);
+        view.Buffer.NumElements = 512 / sizeof(UINT);
+        view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device->CreateShaderResourceView(upload.Get(), &view, vertex_heap->GetCPUDescriptorHandleForHeapStart());
+        ID3D12DescriptorHeap* heaps[]{vertex_heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootDescriptorTable(vertex_slot, vertex_heap->GetGPUDescriptorHandleForHeapStart());
+    } else if (vertices && !fallback) {
+        list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
+    }
     ComPtr<ID3D12Resource> sampled, texture_upload;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> compute_root;
