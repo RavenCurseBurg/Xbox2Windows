@@ -15,6 +15,7 @@
 
 #include "startup_stream_draw.h"
 #include "startup_stream_setup.h"
+#include "startup_slot67_indirect.h"
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -179,10 +180,12 @@ static void* slot67_other_root;  // a second root signature object, for the root
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
 // root; dispatch-same-buffer names the output buffer as the input too.
 // Table controls bind away from the heap start or change the root/view heap after slot 35 without rebinding.
-static int dispatch_slot67(void* device, const std::string& mode)
+static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
     for (UINT i = 0; i < words; ++i) {
@@ -215,6 +218,11 @@ static int dispatch_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
+    if (mode == "dispatch-indirect-output-alias") {
+        const UINT64 address = reinterpret_cast<UINT64>(memory) + 0x20000;
+        const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 5, 0};
+        std::memcpy(descriptors[1], alias, sizeof(alias));
+    }
     const bool change_table_root = mode == "dispatch-table-root-changed";
     const bool change_table_heap = mode == "dispatch-table-heap-changed";
     StreamWord table_gpu = gpu;
@@ -241,6 +249,8 @@ static int dispatch_slot67(void* device, const std::string& mode)
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    Slot67Indirect record;
+    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
     bind();
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
@@ -263,7 +273,11 @@ static int dispatch_slot67(void* device, const std::string& mode)
         invoke(list, 39, 0, 1, word(&constants[1]), 1);
     }
     if (mode == "dispatch-table-offset") invoke(list, 32, 1, word(&heap));  // same heap keeps the offset table
-    if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
+                                 mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
+    else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
+        invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
+    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
@@ -271,6 +285,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
         if (GetTickCount64() >= deadline) return 78;
         Sleep(1);
     }
+    if (indirect && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != 0x8b02a7f1u + i * 0x413b1u) return 79;  // the input must stay as written
     char path[MAX_PATH];
@@ -389,7 +404,7 @@ int main(int argc, char** argv)
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0)
-        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? dispatch_slot67(device, argv[8]) : 10;
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? dispatch_slot67(adapter.Get(), device, argv[8]) : 10;
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;

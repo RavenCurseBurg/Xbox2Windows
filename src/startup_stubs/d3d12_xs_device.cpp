@@ -2786,6 +2786,13 @@ struct IndirectIndexView {
 };
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument,
                                      u64 offset, const IndirectIndexView& indices);
+struct TranslatedDispatch {
+    D3D12_DISPATCH_ARGUMENTS groups{};
+    ID3D12CommandSignature* signature = nullptr;
+    ID3D12Resource* argument = nullptr;
+    u64 offset = 0;
+};
+const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch);
 u64 known_pipeline_key(Wrapper* pipeline);
 
 namespace indirect_other_refusal_code {
@@ -2880,6 +2887,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
+    const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
     const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
         (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
@@ -2948,6 +2956,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             if (samples.Count != 1 || samples.Quality)
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
         }
+    } else if (translated_compute) {
+        if (count != 1 || count_buffer || sig->own().signature_root)
+            return refuse("translated Dispatch requires one rootless command and no count buffer", indirect_compute_pipeline);
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
@@ -2974,6 +2985,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::argument_not_common_state);
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
+    if (translated_compute) {
+        const TranslatedDispatch dispatch{{}, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset};
+        if (const char* reason = record_translated_dispatch(self, dispatch)) return refuse(reason, indirect_compute_pipeline);
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
+    }
     IndirectIndexView index_view;
     if (indexed) {
         auto view = pass.ib;
@@ -3618,15 +3635,17 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 // List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
-bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z);
 void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
-    if (dispatch_translated(self, x, y, z)) return;  // a slot 67 placeholder never reaches the desktop decision
     auto* list = recording(self);
+    const Pass& pass = pass_of(self);
+    if (list && pass.pipeline && pass.pipeline->own().compute_request_key) {
+        record_translated_dispatch(self, {{x, y, z}});
+        return;
+    }
     x2w_startup::ListDispatch request;
     request.list_open = list != nullptr;
     if (list) request.type = list->GetType();
-    const Pass& pass = pass_of(self);
     request.compute_pipeline = pass.compute_pipeline;
     request.compute_root = pass.compute_root != nullptr;
     request.compute_root_has_arguments = pass.compute_root_has_arguments;
