@@ -12,6 +12,8 @@ runs share one cache:
 3. texture-store-none (no Dispatch recorded): every half keeps its sentinel;
 4. texture-store-denied (a texture without unordered access, whose view the stand-in does not create): refused
    with one logged reason, every half keeps its sentinel.
+   texture-store-denied-overwrite tries that same creation over a valid UAV. The shader must still write the
+   first texture through its original descriptor.
 A fifth run binds the same program under a manifest edited to declare no entry values.
 
 Texture input: case A of startup_gfx2hlsl_compute_check.py with a level-zero sample of a 2D texture XORed into the
@@ -99,6 +101,12 @@ def store(directory, consumer, dxc, env):
     assert got == untouched, 'a refused Dispatch wrote the texture'
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an output texture view was not created on the desktop' in refused[0], result.stderr[-3000:]
+
+    got, result = run(directory, consumer, env, 'texture-store-denied-overwrite', layout)
+    assert len(lines(result, 'slot19 view skipped: resource lacks unordered access')) == 1, result.stderr[-3000:]
+    assert got == expected, f'denied overwrite: {sum(a != b for a, b in zip(got, expected))} halves differ'
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+    clean(result)
 
     # Refusals the runtime already had, each with its one logged reason and an untouched texture: an integer view
     # format, another manifest version, another stage, and (with a manifest line added here for a view the consumer

@@ -343,6 +343,13 @@ static int texture_slot67(void* device, const std::string& mode)
     if (!cpu || !gpu) return 73;
     const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
     invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    if (mode == "texture-store-denied-overwrite") {
+        auto denied = texture_desc;
+        denied.Flags = D3D12_RESOURCE_FLAG_NONE;
+        void* const other = make(D3D12_HEAP_TYPE_DEFAULT, denied, D3D12_RESOURCE_STATE_COMMON);
+        if (!other) return 71;
+        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
