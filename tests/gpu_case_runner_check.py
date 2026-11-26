@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -75,8 +76,8 @@ def launcher(directory, name, mode):
 class RunnerChecks(unittest.TestCase):
     def setUp(self):
         R._servers.clear()
-        self.addCleanup(R._close_all)
         self.addCleanup(R._servers.clear)
+        self.addCleanup(R._close_all)          # runs first: the servers of the test are closed before the table is emptied
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
@@ -114,6 +115,26 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(self.run_case(renderer, '--pass', 'a').returncode, 0)
         again = self.run_case(renderer, '--mismatch', 'b')            # case 1 kills the first server; the restart answers it
         self.assertEqual((again.returncode, again.stderr.splitlines()[-1]), (1, 'startup_flat_param mismatch b'))
+
+    def test_every_exit_leaves_no_process_and_no_open_pipe(self):
+        made = []
+        real = R._Server
+
+        def record(*args):
+            made.append(real(*args))
+            return made[-1]
+
+        with unittest.mock.patch.object(R, '_Server', record):
+            self.run_case(launcher(self.dir, 'old', 'no-serve'), '--pass', 'a')      # failed handshake, then the one-shot call
+            self.run_case(launcher(self.dir, 'none', 'no-adapter'), '--pass', 'a')   # skip 77 at the handshake
+            dies = launcher(self.dir, 'dies', 'die-at-1')
+            self.run_case(dies, '--pass', 'a')
+            self.run_case(dies, '--mismatch', 'b')                                   # dead server, restart
+            R._close_all()                                                           # the restarted server, at exit
+        self.assertEqual(len(made), 4)
+        for server in made:
+            self.assertIsNotNone(server.proc.poll())
+            self.assertTrue(all(s.closed for s in (server.proc.stdin, server.proc.stdout, server.proc.stderr)))
 
     def test_x2w_flat_server_zero_uses_one_shot_calls(self):
         renderer = launcher(self.dir, 'off', 'serve')

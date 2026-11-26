@@ -26,8 +26,10 @@ class _Server:
         self.proc = subprocess.Popen([str(renderer), adapter, '--serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, bufsize=1)
         self.banner, self.banner_err, self.ready, self.returncode, self.stderr_text = [], '', False, None, ''
-        threading.Thread(target=self._pump, args=(self.proc.stdout, self.out, 'X2WCASE '), daemon=True).start()
-        threading.Thread(target=self._pump, args=(self.proc.stderr, self.err, 'X2WEND '), daemon=True).start()
+        self.threads = [threading.Thread(target=self._pump, args=(self.proc.stdout, self.out, 'X2WCASE '), daemon=True),
+                        threading.Thread(target=self._pump, args=(self.proc.stderr, self.err, 'X2WEND '), daemon=True)]
+        for thread in self.threads:
+            thread.start()
         first = self._get(self.out)                  # the banner, closed by the marker pair of case -1
         banner_err = self._get(self.err)
         if first is None or first[1] != 0 or banner_err is None:     # closed first (skip 77, an unknown mode, a crash)
@@ -35,6 +37,7 @@ class _Server:
             self.proc.wait()
             self.returncode = self.proc.returncode
             self.stderr_text = ''.join(self._drain(self.err))
+            self._release()
             self.banner = [first[0]] if first else []
             return
         self.banner, self.banner_err, self.ready = [first[0]], banner_err[0], True
@@ -90,12 +93,28 @@ class _Server:
         banner_err, self.banner_err = self.banner_err, ''
         return subprocess.CompletedProcess(self.proc.args, out[1], banner + out[0], banner_err + err[0])
 
+    def _release(self):
+        """Wait for the process and close every pipe, so nothing is left open after any exit."""
+        self.proc.wait()
+        for thread in self.threads:                 # the pumps end at the end of the pipes
+            thread.join(timeout=5)
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def kill(self):
+        self.proc.kill()
+        self._release()
+
     def close(self):
         try:
             self.proc.stdin.close()
             self.proc.wait(timeout=30)
         except (OSError, subprocess.TimeoutExpired):
             self.proc.kill()
+        self._release()
 
 
 def _close_all():
@@ -125,8 +144,7 @@ def run(renderer, adapter, args):
             result = server.case(args)
             if result is not None:
                 return result
-            server.proc.kill()
-            server.proc.wait()
+            server.kill()
             _servers[key] = None
         else:
             _servers[key] = False
