@@ -1,18 +1,18 @@
-name: Build and run the slot 67 indirect fixture
+name: Validate hardware selection for indirect Dispatch
 on:
   push:
-    branches: ['verify/slot67-indirect-dispatch']
+    branches: ['verify/indirect-dispatch-adapter-filter']
 permissions:
   contents: read
 jobs:
   timing:
-    if: github.repository == 'RavenCurseBurg/Xbox2Windows' && github.ref == 'refs/heads/verify/slot67-indirect-dispatch'
+    if: github.repository == 'RavenCurseBurg/Xbox2Windows'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: bd5583709917d949141011f2fcd00c0c7661a18b
+          ref: 04b454c804ff0296197af4adf06b23a7b11fdab0
           persist-credentials: false
       - name: Build the stream consumer and collect source digests
         shell: pwsh
@@ -24,36 +24,37 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --preset release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset release --target startup_stream_consumer startup_indirect_dispatch
+          cmake --build --preset release --target startup_stream_rasterizer startup_indirect_dispatch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $stage = New-Item -ItemType Directory -Force out/mrt-artifact
-          foreach ($name in 'xg_xs.dll','d3d12_xs.dll','startup_stream_consumer.exe','startup_indirect_dispatch.exe') {
+          foreach ($name in 'd3d12_xs.dll','startup_stream_rasterizer.exe','startup_indirect_dispatch.exe') {
             $files = @(Get-ChildItem out/build/release -File -Recurse -Filter $name)
             if ($files.Count -ne 1) { throw "Expected one built $name" }
             Copy-Item -LiteralPath $files[0].FullName -Destination $stage
           }
+          Get-ChildItem out/build/release -Recurse -File -Filter xg_xs.dll | Copy-Item -Destination $stage
           (git rev-parse HEAD) | Set-Content -Encoding ascii "$stage/SOURCE_COMMIT.txt"
           Get-ChildItem $stage -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName).Hash,$_.Name } | Set-Content -Encoding ascii "$stage/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: slot67-consumer
+          name: adapter-filter-binaries
           path: out/mrt-artifact/
           retention-days: 2
           if-no-files-found: error
-      - name: Run the new and existing dispatch fixtures on WARP
+      - name: Run hardware-selector controls and strict WARP readbacks
         shell: pwsh
         run: |
           ./tools/dev.ps1
-          out/pe-env/Scripts/python.exe -B tests/startup_slot67_indirect_dispatch_check.py mutation
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_(slot67_indirect_dispatch|compute_dispatch|indirect_dispatch|indirect_count|indirect_root_constants)_warp$' 2>&1
+          $env:XBOX2WINDOWS_ADAPTER = 'x2w-no-such-hardware-adapter'
+          $rows=ctest --preset release --no-tests=error -j 1 -V -R '^startup_((stream|indirect_dispatch)_adapter_filter|(indirect_dispatch|indirect_count|indirect_root_constants)_warp)$' 2>&1
           $result=$LASTEXITCODE
           $rows | Tee-Object -FilePath out/slot67-warp.log | Select-Object -Last 12
-          if ($result -or $rows -match '\*\*\*Skipped|Not Run') {throw "Failed or skipped a WARP check, exit $result"}
+          if ($result -or $rows -match '\*\*\*Skipped|Not Run' -or -not ($rows -match '100% tests passed out of 5')) {throw "Failed or skipped a selector or WARP check, exit $result"}
+          if (-not ($rows -match 'count word=2, executed=2, result=0x31415935')) {throw 'Missing strict count=2 result'}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: slot67-results
+          name: adapter-filter-logs
           path: out/slot67-warp.log
           if-no-files-found: ignore
           retention-days: 2
