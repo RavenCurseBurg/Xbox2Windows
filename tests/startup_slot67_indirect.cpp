@@ -88,5 +88,6 @@ bool Slot67Indirect::check_record(UINT groups) const
     readback->Unmap(0, &empty);
     const Record expected{initial.front(), groups, groups ? 1u : 0u, groups ? 1u : 0u, initial.back()};
     std::printf("GPU argument record: %08x [%u,%u,%u] %08x\n", actual[0], actual[1], actual[2], actual[3], actual[4]);
+    std::fflush(stdout);
     return actual == expected;
 }
